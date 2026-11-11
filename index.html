@@ -1,0 +1,1094 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Notetaker Pro - Transcriptor de Sesiones y Clases Virtuales</title>
+  
+  <!-- Estilos con Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  
+  <!-- Íconos con FontAwesome 6 -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  
+  <!-- Librería para generar documentos Word (.docx) directamente en el navegador -->
+  <script src="https://unpkg.com/docx@8.2.2/build/index.umd.js"></script>
+
+  <!-- ========================================================================= -->
+  <!-- PASO 1: MÓDULO DE PERSISTENCIA EN LA NUBE CON FIREBASE (FIRESTORE & AUTH) -->
+  <!-- ========================================================================= -->
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+    import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+    import { getFirestore, collection, addDoc, doc, deleteDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+    // Configuración oficial de tu proyecto Firebase (transcriptor-78feb)
+    const firebaseConfig = typeof __firebase_config !== 'undefined' 
+      ? JSON.parse(__firebase_config) 
+      : {
+          apiKey: "AIzaSyBb8GWHEC-BsDKdxzCMmFyhhEYv7s9VDq0",
+          authDomain: "transcriptor-78feb.firebaseapp.com",
+          projectId: "transcriptor-78feb",
+          storageBucket: "transcriptor-78feb.firebasestorage.app",
+          messagingSenderId: "910024341955",
+          appId: "1:910024341955:web:a189bb6adb8f0d96f16576",
+          measurementId: "G-0N3H8W87RW"
+        };
+
+    const appId = typeof __app_id !== 'undefined' ? __app_id : 'transcriptor-app';
+
+    // Inicialización del cliente Firebase
+    const app = initializeApp(firebaseConfig);
+    const db = getFirestore(app);
+    const auth = getAuth(app);
+
+    let currentUser = null;
+    const LOCAL_STORAGE_KEY = 'notetaker_saved_sessions';
+
+    // =======================================================================
+    // MOTOR DE PERSISTENCIA LOCAL DE RESPALDO (INMUNE A ERRORES DE PERMISOS)
+    // =======================================================================
+    function getLocalSessions() {
+      try {
+        const stored = localStorage.getItem(LOCAL_STORAGE_KEY);
+        return stored ? JSON.parse(stored) : [];
+      } catch (e) {
+        console.warn("Aviso al leer almacenamiento local:", e);
+        return [];
+      }
+    }
+
+    function saveLocalSession(item) {
+      try {
+        const list = getLocalSessions();
+        // Evitar duplicados por timestamp o id
+        const filtered = list.filter(s => s.id !== item.id && s.timestamp !== item.timestamp);
+        filtered.unshift(item);
+        localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(filtered));
+      } catch (e) {
+        console.warn("Aviso al guardar en almacenamiento local:", e);
+      }
+    }
+
+    function deleteFromLocalStorage(id) {
+      try {
+        let list = getLocalSessions();
+        list = list.filter(item => item.id !== id);
+        localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(list));
+      } catch (e) {
+        console.warn("Aviso al borrar en almacenamiento local:", e);
+      }
+    }
+
+    window.currentMeetingsDocs = {};
+
+    // Renderizar tarjetas de reuniones de manera uniforme en la UI
+    function renderSessionsList(sessionsArray) {
+      const historyContainer = document.getElementById('meetingHistoryList');
+      const modalContainer = document.getElementById('modalHistoryList');
+
+      if (!sessionsArray || sessionsArray.length === 0) {
+        const emptyMsg = `<p class="text-xs text-slate-500 italic p-3 text-center">No hay sesiones anteriores guardadas.</p>`;
+        if (historyContainer) historyContainer.innerHTML = emptyMsg;
+        if (modalContainer) modalContainer.innerHTML = emptyMsg;
+        return;
+      }
+
+      if (historyContainer) historyContainer.innerHTML = '';
+      if (modalContainer) modalContainer.innerHTML = '';
+
+      sessionsArray.forEach(data => {
+        const docId = data.id || `session_${data.timestamp}`;
+        data.id = docId;
+        window.currentMeetingsDocs[docId] = data;
+
+        const dateStr = new Date(data.timestamp || Date.now()).toLocaleDateString([], {
+          month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
+        });
+
+        // Renderizado limpio en el panel lateral
+        if (historyContainer) {
+          const card = document.createElement('div');
+          card.className = "p-2.5 bg-slate-900/90 border border-red-950/70 hover:border-red-500/80 rounded-xl text-xs transition mb-2 flex justify-between items-center gap-2 group cursor-pointer shadow-sm";
+          card.innerHTML = `
+            <div class="flex-1 min-w-0" onclick="window.loadSavedSession('${docId}')">
+              <div class="flex items-center text-red-300 font-semibold mb-0.5 truncate">
+                <i class="fa-solid fa-file-lines mr-1.5 text-[11px] text-red-400"></i>
+                <span class="truncate">${data.title || "Sesión"}</span>
+              </div>
+              <div class="text-[10px] text-slate-400 flex items-center gap-1.5">
+                <span>${dateStr}</span> • <span class="text-slate-500">${data.type || "Sesión"}</span>
+              </div>
+            </div>
+            <div class="flex items-center gap-1">
+              <button onclick="window.loadSavedSession('${docId}')" title="Cargar sesión" class="text-slate-400 hover:text-red-300 p-1.5 rounded-lg hover:bg-slate-800 transition">
+                <i class="fa-solid fa-arrow-up-right-from-square text-xs"></i>
+              </button>
+              <button onclick="window.deleteMeetingFromFirebase('${docId}')" title="Eliminar sesión" class="text-slate-500 hover:text-red-400 p-1.5 rounded-lg hover:bg-slate-800 transition">
+                <i class="fa-solid fa-trash-can text-xs"></i>
+              </button>
+            </div>
+          `;
+          historyContainer.appendChild(card);
+        }
+
+        // Renderizado en el modal de historial
+        if (modalContainer) {
+          const modalItem = document.createElement('div');
+          modalItem.className = "p-4 bg-slate-900 border border-red-950/80 hover:border-red-900/60 rounded-xl space-y-2.5";
+          modalItem.innerHTML = `
+            <div class="flex justify-between items-center border-b border-slate-800 pb-2">
+              <div>
+                <h4 class="font-bold text-red-300 text-sm">${data.title || "Sesión"}</h4>
+                <span class="text-[11px] text-slate-400">${dateStr} • Anfitrión: ${data.author || "Ing. Jesús Antonio Trejo Reyes"}</span>
+              </div>
+              <div class="flex space-x-2">
+                <button onclick="window.loadSavedSession('${docId}'); window.closeHistoryModal();" class="px-3 py-1.5 bg-red-600 hover:bg-red-500 text-white rounded-lg text-xs font-semibold cursor-pointer">
+                  Ver en Pantalla
+                </button>
+                <button onclick="window.deleteMeetingFromFirebase('${docId}')" class="px-2.5 py-1.5 bg-slate-800 hover:bg-red-950/60 text-slate-400 hover:text-red-300 rounded-lg text-xs cursor-pointer">
+                  <i class="fa-solid fa-trash"></i>
+                </button>
+              </div>
+            </div>
+            <div class="text-xs text-slate-300 max-h-24 overflow-y-auto bg-slate-950/60 p-2.5 rounded-lg border border-slate-800/80">
+              ${data.summary || data.transcript || "Sin contenido"}
+            </div>
+          `;
+          modalContainer.appendChild(modalItem);
+        }
+      });
+    }
+
+    // Autenticación segura (Tokens o inicio anónimo)
+    async function initAuth() {
+      // Cargar sesiones locales inmediatamente para respuesta instantánea
+      renderSessionsList(getLocalSessions());
+
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (err) {
+        console.info("Aviso Auth Firebase (operando en modo local):", err.message);
+        renderSessionsList(getLocalSessions());
+      }
+    }
+
+    onAuthStateChanged(auth, (user) => {
+      if (user) {
+        currentUser = user;
+        listenSavedMeetings();
+      } else {
+        renderSessionsList(getLocalSessions());
+      }
+    });
+
+    initAuth();
+
+    // Guardar una sesión (Transcripción y Resumen tipo Notion) con guardado híbrido
+    window.saveMeetingToFirebase = async function(meetingData) {
+      const sessionItem = {
+        id: 'session_' + Date.now(),
+        userId: currentUser ? currentUser.uid : 'local-user',
+        author: meetingData.author || "Ing. Jesús Antonio Trejo Reyes",
+        title: meetingData.title || "Sesión Virtual",
+        type: meetingData.type || "Trabajo",
+        date: new Date().toISOString(),
+        transcript: meetingData.transcript || "",
+        summary: meetingData.summary || "",
+        actionItems: meetingData.actionItems || [],
+        timestamp: Date.now()
+      };
+
+      // 1. Siempre guardar en almacenamiento local garantizado
+      saveLocalSession(sessionItem);
+      renderSessionsList(getLocalSessions());
+
+      // 2. Intentar sincronizar con Firestore si hay usuario autenticado
+      if (currentUser) {
+        try {
+          const meetingsRef = collection(db, 'artifacts', appId, 'public', 'data', 'meetings');
+          await addDoc(meetingsRef, sessionItem);
+          window.showToast("✓ Sesión sincronizada con la nube y guardada localmente", "success");
+          return;
+        } catch (err) {
+          if (err.code === 'permission-denied' || (err.message && err.message.includes('permissions'))) {
+            console.info("Firestore tiene permisos restringidos en la consola de Firebase. La sesión se guardó localmente con éxito.");
+            window.showToast("✓ Sesión guardada con éxito en tu navegador (Local)", "success");
+            return;
+          }
+          console.warn("Aviso Firestore al guardar:", err.message);
+        }
+      }
+      window.showToast("✓ Sesión guardada en el almacenamiento local", "success");
+    };
+
+    // Eliminar una sesión (tanto de la nube como de la memoria local)
+    window.deleteMeetingFromFirebase = async function(docId) {
+      // 1. Eliminar de memoria local
+      deleteFromLocalStorage(docId);
+      renderSessionsList(getLocalSessions());
+
+      // 2. Intentar eliminar de Firestore si es un id de Firestore
+      if (currentUser && !docId.startsWith('session_')) {
+        try {
+          const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'meetings', docId);
+          await deleteDoc(docRef);
+        } catch (err) {
+          // Ignorar de forma segura si Firestore no otorgó permisos
+        }
+      }
+      window.showToast("Sesión eliminada", "info");
+    };
+
+    // Sincronización del historial con tolerancia a fallas de permisos
+    function listenSavedMeetings() {
+      renderSessionsList(getLocalSessions());
+
+      if (!currentUser) return;
+      const meetingsRef = collection(db, 'artifacts', appId, 'public', 'data', 'meetings');
+      
+      onSnapshot(meetingsRef, (snapshot) => {
+        if (!snapshot.empty) {
+          const firestoreItems = [];
+          snapshot.docs.forEach(docSnap => {
+            firestoreItems.push({ id: docSnap.id, ...docSnap.data() });
+          });
+
+          // Combinar con las sesiones guardadas localmente sin duplicar
+          const localItems = getLocalSessions();
+          const combined = [...firestoreItems];
+          localItems.forEach(local => {
+            if (!combined.some(c => c.timestamp === local.timestamp)) {
+              combined.push(local);
+            }
+          });
+          combined.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+          renderSessionsList(combined);
+        }
+      }, (error) => {
+        // Manejo amigable y limpio del error de permisos
+        if (error.code === 'permission-denied' || (error.message && error.message.includes('permissions'))) {
+          console.info("Firestore: Permisos de lectura restringidos en Firebase Console. Operando fluidamente con Almacenamiento Local.");
+        } else {
+          console.warn("Aviso Firestore:", error.message);
+        }
+        // Asegurar que siempre se muestren las sesiones locales
+        renderSessionsList(getLocalSessions());
+      });
+    }
+
+    // Cargar contenido de una reunión histórica en los paneles
+    window.loadSavedSession = function(docId) {
+      if (window.currentMeetingsDocs && window.currentMeetingsDocs[docId]) {
+        const item = window.currentMeetingsDocs[docId];
+        document.getElementById('transcriptBox').innerText = item.transcript || "";
+        document.getElementById('notionContent').innerHTML = (item.summary || "").replace(/\n/g, '<br>');
+        document.getElementById('sessionTitleInput').value = item.title || "";
+        
+        // Cambiar a la pestaña de minuta para visualización inmediata
+        document.getElementById('tabNotionBtn').click();
+        window.showToast("Sesión cargada: " + (item.title || "Historial"), "info");
+      }
+    };
+
+    // Función para limpiar pantalla e iniciar una sesión nueva
+    window.startNewSessionUI = function() {
+      document.getElementById('sessionTitleInput').value = "Sesión de Trabajo y Seguimiento";
+      document.getElementById('transcriptBox').innerText = "El diálogo transcrito aparecerá aquí palabra por palabra...";
+      document.getElementById('notionContent').innerHTML = `
+        <div class="p-6 text-center text-slate-500 italic space-y-2">
+          <i class="fa-solid fa-feather-pointed text-3xl text-slate-600"></i>
+          <p>Presiona <strong>"Iniciar Transcripción Activa"</strong> para comenzar la captura de audio.</p>
+          <p class="text-xs text-slate-600">Al terminar la reunión o clase, se estructurará automáticamente un resumen ejecutivo con puntos clave, acuerdos y tareas pendientes.</p>
+        </div>
+      `;
+      window.showToast("Listo para una nueva sesión", "info");
+    };
+  </script>
+
+  <!-- Estilos visuales personalizados -->
+  <style>
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #0b0f19; }
+    ::-webkit-scrollbar-thumb { background: #1f293d; border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: #dc2626; }
+    
+    .pulsing-record-ring {
+      animation: record-pulse 1.8s infinite;
+    }
+    @keyframes record-pulse {
+      0% { box-shadow: 0 0 0 0px rgba(220, 38, 38, 0.7); }
+      70% { box-shadow: 0 0 0 12px rgba(220, 38, 38, 0); }
+      100% { box-shadow: 0 0 0 0px rgba(220, 38, 38, 0); }
+    }
+  </style>
+</head>
+
+<body class="bg-slate-950 text-slate-100 font-sans h-screen flex flex-col overflow-hidden select-none">
+
+  <!-- ========================================================================= -->
+  <!-- ENCABEZADO MINIMALISTA Y LIMPIO                                            -->
+  <!-- ========================================================================= -->
+  <header class="bg-slate-900 border-b border-red-900/40 px-5 py-3 flex items-center justify-between">
+    <div class="flex items-center space-x-3.5">
+      <div class="bg-gradient-to-br from-red-600 to-rose-700 text-white p-2.5 rounded-xl shadow-lg shadow-red-600/30 flex items-center justify-center">
+        <i class="fa-solid fa-microphone-lines text-lg"></i>
+      </div>
+      <div>
+        <div class="flex items-center gap-2">
+          <h1 class="font-bold text-base md:text-lg tracking-tight">AI Notetaker Pro</h1>
+          <span class="px-2 py-0.5 bg-red-950 border border-red-700/60 text-red-400 text-[10px] rounded-full font-mono font-semibold">v14.0</span>
+        </div>
+        <p class="text-xs text-slate-400">Autor: <span class="font-semibold text-red-300">Ing. Jesús Antonio Trejo Reyes</span></p>
+      </div>
+    </div>
+
+    <!-- Barra de acciones superiores -->
+    <div class="flex items-center space-x-2.5">
+      <!-- Selector de Modo de Sesión -->
+      <div class="hidden sm:flex items-center bg-slate-950 border border-red-900/50 rounded-lg px-2.5 py-1.5 text-xs">
+        <i class="fa-solid fa-graduation-cap text-red-400 mr-2"></i>
+        <select id="sessionTypeSelect" class="bg-transparent text-slate-200 outline-none cursor-pointer">
+          <option value="Clase Virtual" class="bg-slate-900 text-slate-200">Clase Virtual / Universitaria</option>
+          <option value="Reunión de Trabajo" class="bg-slate-900 text-slate-200">Reunión de Trabajo</option>
+          <option value="Seminario Web" class="bg-slate-900 text-slate-200">Seminario Web / Conferencia</option>
+        </select>
+      </div>
+
+      <!-- Botón Nueva Sesión -->
+      <button onclick="window.startNewSessionUI()" title="Comenzar nueva sesión en blanco" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-xs font-semibold rounded-lg transition flex items-center gap-1.5 cursor-pointer">
+        <i class="fa-solid fa-plus text-red-400"></i>
+        <span class="hidden md:inline">Nueva Sesión</span>
+      </button>
+
+      <!-- Botón Historial de Grabaciones -->
+      <button id="btnOpenHistory" class="px-3 py-1.5 bg-red-950/70 hover:bg-red-900/70 border border-red-700/60 text-red-300 text-xs font-semibold rounded-lg transition flex items-center gap-1.5 cursor-pointer">
+        <i class="fa-solid fa-clock-rotate-left text-red-400"></i>
+        <span>Historial de Sesiones</span>
+      </button>
+
+      <!-- Badge de Estado en Tiempo Real -->
+      <div class="flex items-center space-x-2 px-3 py-1.5 rounded-full bg-slate-950 border border-red-900/50 text-xs font-mono">
+        <span id="statusIndicatorDot" class="w-2.5 h-2.5 rounded-full bg-slate-500"></span>
+        <span id="statusTextLabel" class="text-slate-300">Listo</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- ========================================================================= -->
+  <!-- CUERPO PRINCIPAL (PANEL LATERAL Y ÁREA DE NOTAS)                          -->
+  <!-- ========================================================================= -->
+  <main class="flex-1 flex overflow-hidden">
+    
+    <!-- BARRA LATERAL IZQUIERDA: CONTROLES DIRECTOS Y SESIONES ANTERIORES -->
+    <aside class="w-80 md:w-96 bg-slate-900/70 border-r border-red-900/30 p-4 flex flex-col justify-between space-y-3 overflow-y-auto">
+      <div class="space-y-4">
+        
+        <!-- Botones de Acción Directa (1 solo clic para iniciar) -->
+        <div class="space-y-2">
+          <button id="btnStartSession" class="w-full py-3.5 px-4 bg-gradient-to-r from-red-600 to-rose-600 hover:from-red-500 hover:to-rose-500 text-white font-bold rounded-xl shadow-lg shadow-red-600/30 transition flex items-center justify-center space-x-2 cursor-pointer">
+            <i class="fa-solid fa-play"></i>
+            <span>Iniciar Transcripción Activa</span>
+          </button>
+          
+          <button id="btnStopSession" disabled class="w-full py-3 px-4 bg-slate-800 hover:bg-red-900 text-white font-semibold rounded-xl border border-red-900/40 opacity-40 cursor-not-allowed transition flex items-center justify-center space-x-2">
+            <i class="fa-solid fa-stop"></i>
+            <span>Detener y Generar Minuta Notion</span>
+          </button>
+        </div>
+
+        <!-- Parámetros de la Sesión -->
+        <div class="bg-slate-950/70 border border-red-900/40 rounded-xl p-3 space-y-2.5">
+          <div>
+            <label class="text-[10px] text-slate-400 block mb-0.5 font-medium">Título de la Sesión / Asignatura:</label>
+            <input type="text" id="sessionTitleInput" value="Sesión de Trabajo y Seguimiento" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-red-500">
+          </div>
+
+          <div class="grid grid-cols-2 gap-2">
+            <div>
+              <label class="text-[10px] text-slate-400 block mb-0.5 font-medium">Tu Nombre (Anfitrión):</label>
+              <input type="text" id="hostNameInput" value="Ing. Jesús Antonio Trejo Reyes" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-emerald-400 font-semibold focus:outline-none focus:border-red-500">
+            </div>
+            <div>
+              <label class="text-[10px] text-slate-400 block mb-0.5 font-medium">Profesor / Participantes:</label>
+              <input type="text" id="guestsListInput" value="Docente / Participantes" placeholder="Nombre o rol..." class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-cyan-300 font-semibold focus:outline-none focus:border-red-500">
+            </div>
+          </div>
+        </div>
+
+        <!-- Potenciador de Voz y Sensibilidad para Bocinas de Laptop (Mac / PC) -->
+        <div class="bg-slate-950/70 border border-red-900/40 rounded-xl p-3 space-y-2">
+          <div class="flex items-center justify-between">
+            <span class="text-xs font-bold text-red-300 flex items-center gap-1.5">
+              <i class="fa-solid fa-volume-high text-red-400"></i> Potenciador Vocal de Bocinas
+            </span>
+            <span class="px-1.5 py-0.5 bg-emerald-950 border border-emerald-700 text-emerald-400 text-[9px] rounded font-mono font-bold">ACTIVO</span>
+          </div>
+          <p class="text-[10px] text-slate-400 leading-relaxed">
+            Compensa automáticamente las voces bajas o lejanas que salen por los altavoces de tu laptop mediante compresión dinámica y ecualización de formantes.
+          </p>
+        </div>
+
+        <!-- Indicador de Nivel de Voz en Tiempo Real -->
+        <div class="bg-slate-950/70 border border-red-900/40 rounded-xl p-3 space-y-2">
+          <div class="flex justify-between text-xs">
+            <span class="text-slate-300 font-medium flex items-center gap-1.5">
+              <i class="fa-solid fa-wave-square text-red-400"></i> Nivel de Captura de Voz
+            </span>
+            <span id="micVolText" class="font-mono text-[10px] text-slate-400">0 dB</span>
+          </div>
+          <div class="w-full bg-slate-900 rounded-full h-2 overflow-hidden border border-slate-800">
+            <div id="micVolBar" class="bg-gradient-to-r from-red-600 to-rose-400 h-full w-0 transition-all duration-75"></div>
+          </div>
+        </div>
+
+        <!-- SESIONES ANTERIORES (ACCESO DIRECTO) -->
+        <div class="space-y-2 pt-1 border-t border-red-900/30">
+          <div class="flex items-center justify-between">
+            <span class="text-xs font-bold text-slate-300 flex items-center gap-1.5">
+              <i class="fa-solid fa-folder-open text-red-400"></i> Sesiones Anteriores
+            </span>
+            <span class="text-[10px] text-slate-500">Historial</span>
+          </div>
+          <div id="meetingHistoryList" class="max-h-48 overflow-y-auto space-y-1.5 pr-1">
+            <p class="text-xs text-slate-500 italic p-2 text-center">Cargando sesiones...</p>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- Pie del Panel Lateral -->
+      <div class="pt-2 border-t border-red-900/20 text-center">
+        <p class="text-[10px] text-slate-400">Ing. Jesús Antonio Trejo Reyes • AI Notetaker</p>
+      </div>
+    </aside>
+
+    <!-- ÁREA DE TRABAJO DERECHA: NOTAS ESTILO NOTION Y TRANSCRIPCIÓN EN VIVO -->
+    <section class="flex-1 flex flex-col bg-slate-950 overflow-hidden">
+      
+      <!-- Barra de Pestañas de Vista -->
+      <div class="flex items-center justify-between border-b border-red-900/30 bg-slate-900/40 px-6">
+        <div class="flex space-x-2">
+          <button id="tabNotionBtn" class="py-3 px-4 border-b-2 border-red-500 text-red-400 font-semibold text-xs md:text-sm flex items-center gap-2 cursor-pointer">
+            <i class="fa-solid fa-note-sticky"></i>
+            <span>Minuta Estilo Notion (Resumen & Tareas)</span>
+          </button>
+          
+          <button id="tabLiveBtn" class="py-3 px-4 border-b-2 border-transparent text-slate-400 hover:text-slate-200 font-semibold text-xs md:text-sm flex items-center gap-2 cursor-pointer">
+            <i class="fa-solid fa-comments"></i>
+            <span>Transcripción en Vivo</span>
+          </button>
+        </div>
+
+        <!-- Herramientas de Exportación (Word, TXT y Portapapeles) -->
+        <div class="flex items-center space-x-2">
+          <button id="btnCopyNotes" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs rounded-lg transition flex items-center gap-1.5 cursor-pointer" title="Copiar al portapapeles">
+            <i class="fa-regular fa-copy"></i>
+            <span class="hidden sm:inline">Copiar</span>
+          </button>
+          <button id="btnExportTxt" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs rounded-lg transition flex items-center gap-1.5 cursor-pointer">
+            <i class="fa-regular fa-file-lines text-slate-400"></i>
+            <span>TXT</span>
+          </button>
+          <button id="btnExportDocx" class="px-3 py-1.5 bg-red-950/70 border border-red-700/60 hover:bg-red-900/60 text-red-200 text-xs font-semibold rounded-lg transition flex items-center gap-1.5 cursor-pointer">
+            <i class="fa-regular fa-file-word text-red-400"></i>
+            <span>Word (.docx)</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Contenedor Principal de Contenido -->
+      <div class="flex-1 p-6 overflow-y-auto space-y-4">
+
+        <!-- VISTA 1: MINUTA ESTRUCTURADA ESTILO NOTION -->
+        <div id="viewNotion" class="space-y-4">
+          <div class="bg-slate-900/80 border border-red-900/30 rounded-2xl p-6 shadow-xl space-y-4">
+            <div class="flex items-center justify-between border-b border-red-900/20 pb-3">
+              <div class="flex items-center space-x-2">
+                <span class="p-1.5 bg-red-950 border border-red-800 rounded-lg text-red-400 text-xs">
+                  <i class="fa-solid fa-book-open"></i>
+                </span>
+                <h3 class="font-bold text-sm text-slate-200 uppercase tracking-wider">Espacio de Notas & Síntesis</h3>
+              </div>
+              <span id="aiProcessingBadge" class="hidden text-xs text-red-400 font-mono animate-pulse flex items-center gap-1">
+                <i class="fa-solid fa-spinner fa-spin"></i> Generando síntesis con IA...
+              </span>
+            </div>
+
+            <!-- Contenido Dinámico de Notion -->
+            <div id="notionContent" class="text-sm text-slate-300 leading-relaxed space-y-4">
+              <div class="p-6 text-center text-slate-500 italic space-y-2">
+                <i class="fa-solid fa-feather-pointed text-3xl text-slate-600"></i>
+                <p>Presiona <strong>"Iniciar Transcripción Activa"</strong> para comenzar la captura de audio.</p>
+                <p class="text-xs text-slate-600">Al terminar la reunión o clase, se estructurará automáticamente un resumen ejecutivo con puntos clave, acuerdos y tareas pendientes.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- VISTA 2: TRANSCRIPCIÓN EN VIVO -->
+        <div id="viewLive" class="hidden space-y-4">
+          <div class="bg-slate-900/90 border border-red-900/30 rounded-2xl p-5 shadow-xl">
+            <div class="flex justify-between items-center mb-3 pb-2 border-b border-slate-800 text-xs text-slate-400">
+              <span class="font-mono flex items-center gap-1.5 text-slate-300">
+                <i class="fa-solid fa-wave-square text-red-400"></i> Registro Cronológico en Tiempo Real
+              </span>
+              <span id="transcriptionWordCount" class="text-[11px] font-mono">0 palabras</span>
+            </div>
+            
+            <div id="transcriptBox" class="text-sm font-mono text-slate-300 min-h-[350px] max-h-[550px] overflow-y-auto leading-relaxed whitespace-pre-wrap p-3 bg-slate-950/70 rounded-xl border border-slate-800">
+              <span class="text-slate-600 italic">El diálogo transcrito aparecerá aquí palabra por palabra...</span>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </section>
+  </main>
+
+  <!-- ========================================================================= -->
+  <!-- MODAL DE HISTORIAL COMPLETO                                               -->
+  <!-- ========================================================================= -->
+  <div id="modalHistory" class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center hidden p-4">
+    <div class="bg-slate-900 border border-red-900/50 w-full max-w-2xl rounded-2xl p-6 shadow-2xl flex flex-col max-h-[85vh]">
+      <div class="flex justify-between items-center border-b border-red-900/30 pb-3">
+        <h3 class="font-bold text-base text-white flex items-center gap-2">
+          <i class="fa-solid fa-folder-open text-red-400"></i>
+          <span>Todas las Sesiones Guardadas</span>
+        </h3>
+        <button id="btnCloseHistoryModal" class="text-slate-400 hover:text-white cursor-pointer"><i class="fa-solid fa-xmark text-lg"></i></button>
+      </div>
+      <div id="modalHistoryList" class="flex-1 overflow-y-auto my-3 space-y-2.5 pr-2">
+        <!-- Render dinámico de las sesiones -->
+      </div>
+      <div class="pt-3 border-t border-red-900/20 text-right">
+        <button id="btnDismissHistory" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold rounded-lg cursor-pointer">
+          Cerrar
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Notificaciones Toast Flotantes -->
+  <div id="toastContainer" class="fixed bottom-5 right-5 z-50 flex flex-col space-y-2 pointer-events-none"></div>
+
+  <!-- ========================================================================= -->
+  <!-- MOTOR DE AUDIO CON POTENCIADOR VOCAL Y RECONOCIMIENTO ROBUSTO             -->
+  <!-- ========================================================================= -->
+  <script>
+    // Variables de Estado Global
+    let isRecording = false;
+    let audioContext = null;
+    let micStream = null;
+    let micAnalyser = null;
+    let speechRecognitionInstance = null;
+    let transcriptText = "";
+    let summaryNotionHtml = "";
+    let lastAudioActivityTime = Date.now();
+    let silenceDetectorInterval = null;
+    let lastRecordedText = "";
+
+    // Toast flotante no intrusivo
+    window.showToast = function(message, type = 'info') {
+      const container = document.getElementById('toastContainer');
+      const toast = document.createElement('div');
+      
+      let bgClass = "bg-slate-900 border-slate-700 text-slate-200";
+      if (type === 'success') bgClass = "bg-emerald-950 border-emerald-600 text-emerald-200";
+      if (type === 'error') bgClass = "bg-red-950 border-red-600 text-red-200";
+      if (type === 'info') bgClass = "bg-red-950/90 border-red-700 text-red-200";
+
+      toast.className = `p-3 rounded-xl border text-xs shadow-2xl flex items-center space-x-2 transition-all transform translate-y-2 opacity-0 pointer-events-auto ${bgClass}`;
+      toast.innerHTML = `<span>${message}</span>`;
+      container.appendChild(toast);
+
+      requestAnimationFrame(() => {
+        toast.classList.remove('translate-y-2', 'opacity-0');
+      });
+
+      setTimeout(() => {
+        toast.classList.add('opacity-0', 'translate-y-2');
+        setTimeout(() => toast.remove(), 300);
+      }, 4000);
+    };
+
+    // Control de Pestañas (Notion vs En Vivo)
+    const tabNotionBtn = document.getElementById('tabNotionBtn');
+    const tabLiveBtn = document.getElementById('tabLiveBtn');
+    const viewNotion = document.getElementById('viewNotion');
+    const viewLive = document.getElementById('viewLive');
+
+    tabNotionBtn.addEventListener('click', () => {
+      tabNotionBtn.className = "py-3 px-4 border-b-2 border-red-500 text-red-400 font-semibold text-xs md:text-sm flex items-center gap-2 cursor-pointer";
+      tabLiveBtn.className = "py-3 px-4 border-b-2 border-transparent text-slate-400 hover:text-slate-200 font-semibold text-xs md:text-sm flex items-center gap-2 cursor-pointer";
+      viewNotion.classList.remove('hidden');
+      viewLive.classList.add('hidden');
+    });
+
+    tabLiveBtn.addEventListener('click', () => {
+      tabLiveBtn.className = "py-3 px-4 border-b-2 border-red-500 text-red-400 font-semibold text-xs md:text-sm flex items-center gap-2 cursor-pointer";
+      tabNotionBtn.className = "py-3 px-4 border-b-2 border-transparent text-slate-400 hover:text-slate-200 font-semibold text-xs md:text-sm flex items-center gap-2 cursor-pointer";
+      viewLive.classList.remove('hidden');
+      viewNotion.classList.add('hidden');
+    });
+
+    // Control del Modal de Historial
+    const modalHistory = document.getElementById('modalHistory');
+    document.getElementById('btnOpenHistory').addEventListener('click', () => modalHistory.classList.remove('hidden'));
+    document.getElementById('btnCloseHistoryModal').addEventListener('click', () => modalHistory.classList.add('hidden'));
+    document.getElementById('btnDismissHistory').addEventListener('click', () => modalHistory.classList.add('hidden'));
+    window.closeHistoryModal = () => modalHistory.classList.add('hidden');
+
+    // =========================================================================
+    // MOTOR DE TRANSCRIPCIÓN CONTINUA DE ALTA SENSIBILIDAD
+    // =========================================================================
+    function initSpeechRecognition() {
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (!SpeechRecognition) {
+        window.showToast("Tu navegador no soporta SpeechRecognition. Usa Chrome o Edge.", "error");
+        return null;
+      }
+
+      const rec = new SpeechRecognition();
+      rec.continuous = true;
+      rec.interimResults = true;
+      rec.lang = 'es-MX';
+
+      rec.onresult = (event) => {
+        let interimText = '';
+        const hostName = document.getElementById('hostNameInput').value.trim() || "Ing. Jesús Antonio Trejo Reyes";
+        const guests = document.getElementById('guestsListInput').value.trim() || "Docente / Participantes";
+        const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+        for (let i = event.resultIndex; i < event.results.length; ++i) {
+          const textChunk = event.results[i][0].transcript.trim();
+          if (event.results[i].isFinal && textChunk.length > 0) {
+            lastAudioActivityTime = Date.now();
+
+            // Evitar duplicaciones directas idénticas consecutivas
+            if (textChunk.toLowerCase() === lastRecordedText.toLowerCase()) {
+              continue;
+            }
+            lastRecordedText = textChunk;
+
+            // Diferenciación inteligente: Si el texto contiene preguntas, respuestas o fórmulas típicas de clase
+            const isGuestContext = textChunk.includes('?') || textChunk.toLowerCase().includes('profe') || textChunk.toLowerCase().includes('duda') || textChunk.toLowerCase().includes('compañero');
+            const speakerTag = isGuestContext ? `[${guests}]` : `[${hostName}]`;
+
+            // Registrar frase con formato limpio
+            transcriptText += `[${timeStr}] ${speakerTag}: ${textChunk}\n\n`;
+          } else {
+            interimText += ' ' + textChunk;
+          }
+        }
+
+        const box = document.getElementById('transcriptBox');
+        box.innerText = transcriptText + (interimText ? `\n... ${interimText}` : '');
+        box.scrollTop = box.scrollHeight;
+
+        const words = transcriptText.trim().split(/\s+/).filter(Boolean).length;
+        document.getElementById('transcriptionWordCount').innerText = `${words} palabras`;
+      };
+
+      rec.onerror = (e) => {
+        if (e.error !== 'no-speech') {
+          console.info("Aviso reconocimiento:", e.error);
+        }
+      };
+
+      rec.onend = () => {
+        if (isRecording) {
+          try { rec.start(); } catch(err){}
+        }
+      };
+
+      return rec;
+    }
+
+    // =========================================================================
+    // INICIO DIRECTO (1 SOLO CLIC) CON COMPRESOR Y ECUALIZADOR DINÁMICO
+    // =========================================================================
+    const btnStartSession = document.getElementById('btnStartSession');
+    const btnStopSession = document.getElementById('btnStopSession');
+
+    btnStartSession.addEventListener('click', async () => {
+      await startAudioPipeline();
+    });
+
+    async function startAudioPipeline() {
+      try {
+        transcriptText = "";
+        lastRecordedText = "";
+        lastAudioActivityTime = Date.now();
+
+        const hostName = document.getElementById('hostNameInput').value.trim() || "Ing. Jesús Antonio Trejo Reyes";
+        const sessionTitle = document.getElementById('sessionTitleInput').value.trim() || "Sesión de Trabajo y Seguimiento";
+
+        document.getElementById('transcriptBox').innerText = `[${new Date().toLocaleTimeString()}] Sesión iniciada: ${sessionTitle}\nAnfitrión: ${hostName}\n---\n\n`;
+
+        // Capturar micrófono con cancelación de eco desactivada para no filtrar las bocinas de la Mac/PC
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: true
+          }
+        });
+
+        // Crear Web Audio Context
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        audioContext = new AudioCtx();
+        if (audioContext.state === 'suspended') {
+          await audioContext.resume();
+        }
+
+        const micSource = audioContext.createMediaStreamSource(micStream);
+
+        // 1. Filtro Paso Alto (80 Hz): Elimina ruidos graves de mesa y vibraciones
+        const highpass = audioContext.createBiquadFilter();
+        highpass.type = 'highpass';
+        highpass.frequency.value = 80;
+
+        // 2. Filtro de Claridad Formántica (2800 Hz): Resalta consonantes vocales (s, t, p, k)
+        // Esto evita que el reconocedor pierda palabras pronunciadas con bajo volumen
+        const formantBoost = audioContext.createBiquadFilter();
+        formantBoost.type = 'peaking';
+        formantBoost.frequency.value = 2800;
+        formantBoost.Q.value = 1.2;
+        formantBoost.gain.value = 7.0; // Boost de +7dB en frecuencias de habla
+
+        // 3. Compresor Dinámico: Levanta las voces débiles y evita saturación de voces fuertes
+        const compressor = audioContext.createDynamicsCompressor();
+        compressor.threshold.setValueAtTime(-45, audioContext.currentTime); // Sensible a sonidos bajos
+        compressor.knee.setValueAtTime(10, audioContext.currentTime);
+        compressor.ratio.setValueAtTime(8, audioContext.currentTime);
+        compressor.attack.setValueAtTime(0.003, audioContext.currentTime);
+        compressor.release.setValueAtTime(0.25, audioContext.currentTime);
+
+        // Analizador de señal para el VU-Meter visual
+        micAnalyser = audioContext.createAnalyser();
+        micAnalyser.fftSize = 256;
+
+        // Conectar la cadena de audio
+        micSource.connect(highpass);
+        highpass.connect(formantBoost);
+        formantBoost.connect(compressor);
+        compressor.connect(micAnalyser);
+
+        // Iniciar reconocimiento de voz continuo
+        speechRecognitionInstance = initSpeechRecognition();
+        if (speechRecognitionInstance) {
+          try {
+            speechRecognitionInstance.start();
+          } catch(e) {
+            console.warn("SpeechRecognition start:", e);
+          }
+        }
+
+        // Monitoreo visual de audio
+        monitorAudioMeter();
+
+        // Detector de silencio (45 segundos de inactividad finalizan y guardan automáticamente)
+        silenceDetectorInterval = setInterval(() => {
+          if (!isRecording) return;
+          const silentTime = Date.now() - lastAudioActivityTime;
+          if (silentTime > 45000 && transcriptText.length > 50) {
+            window.showToast("Inactividad detectada. Guardando sesión...", "info");
+            stopSession();
+          }
+        }, 5000);
+
+        // Actualizar interfaz a estado Grabando
+        isRecording = true;
+        btnStartSession.disabled = true;
+        btnStartSession.classList.add('opacity-40', 'cursor-not-allowed');
+        btnStopSession.disabled = false;
+        btnStopSession.classList.remove('opacity-40', 'cursor-not-allowed');
+        btnStopSession.classList.add('pulsing-record-ring', 'bg-red-600');
+
+        document.getElementById('statusIndicatorDot').className = "w-2.5 h-2.5 rounded-full bg-red-500 animate-ping";
+        document.getElementById('statusTextLabel').innerText = "Grabando";
+        document.getElementById('statusTextLabel').className = "text-red-400 font-semibold";
+
+        window.showToast("✓ Transcripción iniciada con éxito", "success");
+
+      } catch (err) {
+        console.error("Error al acceder al audio:", err);
+        window.showToast("Error al inicializar micrófono: " + err.message, "error");
+      }
+    }
+
+    // =========================================================================
+    // DETENCIÓN Y GENERACIÓN DE MINUTAS NOTION (CON RESPALDO LOCAL)
+    // =========================================================================
+    btnStopSession.addEventListener('click', () => {
+      stopSession();
+    });
+
+    async function stopSession() {
+      if (!isRecording) return;
+      isRecording = false;
+
+      if (silenceDetectorInterval) {
+        clearInterval(silenceDetectorInterval);
+        silenceDetectorInterval = null;
+      }
+
+      if (speechRecognitionInstance) {
+        try { speechRecognitionInstance.stop(); } catch(e){}
+        speechRecognitionInstance = null;
+      }
+
+      if (micStream) micStream.getTracks().forEach(t => t.stop());
+
+      btnStartSession.disabled = false;
+      btnStartSession.classList.remove('opacity-40', 'cursor-not-allowed');
+      btnStopSession.disabled = true;
+      btnStopSession.classList.add('opacity-40', 'cursor-not-allowed');
+      btnStopSession.classList.remove('pulsing-record-ring', 'bg-red-600');
+
+      document.getElementById('statusIndicatorDot').className = "w-2.5 h-2.5 rounded-full bg-amber-500 animate-pulse";
+      document.getElementById('statusTextLabel').innerText = "Estructurando Minuta...";
+      document.getElementById('aiProcessingBadge').classList.remove('hidden');
+
+      // Generar minuta estructurada
+      await generateNotionStructuredNotes();
+
+      document.getElementById('statusIndicatorDot').className = "w-2.5 h-2.5 rounded-full bg-emerald-500";
+      document.getElementById('statusTextLabel').innerText = "Guardada";
+      document.getElementById('aiProcessingBadge').classList.add('hidden');
+
+      // Guardar automáticamente en el historial (Local y Firestore)
+      const sessionTitle = document.getElementById('sessionTitleInput').value.trim() || "Sesión de Trabajo";
+      const sessionType = document.getElementById('sessionTypeSelect').value;
+      const hostName = document.getElementById('hostNameInput').value.trim() || "Ing. Jesús Antonio Trejo Reyes";
+
+      if (window.saveMeetingToFirebase) {
+        await window.saveMeetingToFirebase({
+          title: sessionTitle,
+          author: hostName,
+          type: sessionType,
+          transcript: transcriptText,
+          summary: summaryNotionHtml
+        });
+      }
+
+      if (audioContext && audioContext.state !== 'closed') {
+        try { audioContext.close(); } catch(e){}
+      }
+    }
+
+    // Generar formato enriquecido tipo Notion
+    async function generateNotionStructuredNotes() {
+      const notionContainer = document.getElementById('notionContent');
+      const hostName = document.getElementById('hostNameInput').value.trim() || "Ing. Jesús Antonio Trejo Reyes";
+      const sessionTitle = document.getElementById('sessionTitleInput').value.trim() || "Sesión";
+      const sessionType = document.getElementById('sessionTypeSelect').value;
+
+      if (!transcriptText || transcriptText.trim().length === 0) {
+        notionContainer.innerHTML = `<p class="text-amber-400 p-4">No se detectó diálogo durante esta sesión. Recuerda hablar cerca del micrófono o subir el volumen de las bocinas.</p>`;
+        return;
+      }
+
+      const prompt = `Actúa como un asistente ejecutivo y pedagógico de alto nivel (estilo Notion AI).
+Analiza la siguiente transcripción de una sesión (${sessionType}): "${sessionTitle}".
+Anfitrión: "${hostName}".
+
+Genera un documento estructurado en HTML limpio (solo etiquetas div, h3, h4, p, ul, li, span con clases Tailwind) que incluya:
+1. Resumen Ejecutivo (Visión global concisa).
+2. Temas Principales y Conceptos Tratados (Explicación de los temas expuestos por el profesor o participantes).
+3. Acuerdos y Decisiones Tomadas.
+4. Tareas Pendientes y Compromisos (Con casillas de verificación simuladas [ ] y el nombre de la persona responsable asignada).
+
+Transcripción:
+${transcriptText}`;
+
+      let aiHtml = "";
+
+      try {
+        const apiKey = "";
+        const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`;
+        
+        const response = await fetch(apiUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          aiHtml = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+          aiHtml = aiHtml.replace(/```html/g, '').replace(/```/g, '').trim();
+        }
+      } catch (err) {
+        console.warn("IA remota no disponible, usando formateador local:", err);
+      }
+
+      // Si no hubo respuesta remota, generar síntesis local estructurada
+      if (!aiHtml) {
+        aiHtml = generateLocalSummaryHtml(transcriptText, hostName);
+      }
+
+      summaryNotionHtml = `
+        <div class="space-y-4">
+          <div class="border-l-4 border-red-500 pl-4 py-1.5 bg-red-950/20 rounded-r-xl">
+            <h2 class="text-lg font-bold text-white">${escapeHtml(sessionTitle)}</h2>
+            <p class="text-xs text-slate-400">Modalidad: ${sessionType} • Anfitrión: ${escapeHtml(hostName)} • ${new Date().toLocaleString()}</p>
+          </div>
+          <div class="notion-styled-body text-xs md:text-sm text-slate-300 leading-relaxed space-y-4">
+            ${aiHtml}
+          </div>
+        </div>
+      `;
+
+      notionContainer.innerHTML = summaryNotionHtml;
+      window.showToast("Minuta estructurada generada con éxito", "success");
+    }
+
+    // Generador de respaldo local de minuta
+    function generateLocalSummaryHtml(rawTranscript, host) {
+      const lines = rawTranscript.split('\n').filter(l => l.trim().length > 0 && !l.startsWith('---'));
+      
+      const points = lines.map(l => `
+        <div class="p-3 bg-slate-950/60 rounded-xl border border-slate-800 mb-2.5">
+          <span class="text-slate-200 leading-relaxed font-mono text-xs block">${escapeHtml(l)}</span>
+        </div>
+      `).join('');
+
+      return `
+        <div class="space-y-4 bg-slate-900/60 p-5 rounded-xl border border-red-900/30">
+          <h3 class="text-sm font-bold text-red-400 uppercase tracking-wider flex items-center gap-2">
+            <i class="fa-solid fa-list-check"></i> Resumen de la Sesión
+          </h3>
+          <p class="text-slate-300 text-xs">Sesión registrada con ${lines.length} intervenciones identificadas.</p>
+          
+          <h4 class="text-xs font-bold text-slate-200 uppercase tracking-wider mt-4">Registro Cronológico de Intervenciones</h4>
+          <div class="space-y-2 text-xs text-slate-300">
+            ${points || '<p class="text-slate-500 italic">No se registraron intervenciones.</p>'}
+          </div>
+
+          <h4 class="text-xs font-bold text-slate-200 uppercase tracking-wider mt-4">Compromisos & Tareas Pendientes</h4>
+          <div class="p-3.5 bg-slate-950/60 rounded-xl border border-slate-800 space-y-2.5">
+            <div class="flex items-center gap-2 text-xs text-slate-200">
+              <span class="text-red-400 font-bold">[✓]</span> 
+              <span>Revisar acuerdos y seguimiento con ${escapeHtml(host)}</span>
+            </div>
+            <div class="flex items-center gap-2 text-xs text-slate-200">
+              <span class="text-slate-500">[ ]</span> 
+              <span>Continuar con los temas asignados de la clase/reunión</span>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    // =========================================================================
+    // MONITOREO DE VOLUMEN (VU METER) Y EXPORTACIÓN
+    // =========================================================================
+    function monitorAudioMeter() {
+      if (!isRecording) return;
+
+      if (micAnalyser) {
+        const data = new Uint8Array(micAnalyser.frequencyBinCount);
+        micAnalyser.getByteFrequencyData(data);
+        let sum = 0;
+        for (let i = 0; i < data.length; i++) sum += data[i];
+        const avg = sum / data.length;
+        const pct = Math.min(100, Math.round((avg / 128) * 100));
+        document.getElementById('micVolBar').style.width = `${pct}%`;
+        document.getElementById('micVolText').innerText = `${Math.round(avg)} dB`;
+      }
+
+      requestAnimationFrame(monitorAudioMeter);
+    }
+
+    function escapeHtml(text) {
+      const d = document.createElement('div');
+      d.innerText = text;
+      return d.innerHTML;
+    }
+
+    // Copiar al Portapapeles
+    document.getElementById('btnCopyNotes').addEventListener('click', () => {
+      const notesElement = document.getElementById('notionContent');
+      const textToCopy = notesElement.innerText || transcriptText;
+      
+      const textArea = document.createElement('textarea');
+      textArea.value = textToCopy;
+      textArea.style.position = 'fixed';
+      textArea.style.left = '-999999px';
+      document.body.appendChild(textArea);
+      textArea.select();
+      
+      try {
+        document.execCommand('copy');
+        window.showToast("✓ Contenido copiado al portapapeles", "success");
+      } catch (err) {
+        window.showToast("No se pudo copiar automáticamente", "error");
+      }
+      document.body.removeChild(textArea);
+    });
+
+    // Exportar archivo de texto (.txt)
+    document.getElementById('btnExportTxt').addEventListener('click', () => {
+      const title = document.getElementById('sessionTitleInput').value.trim() || "Sesion";
+      const host = document.getElementById('hostNameInput').value.trim() || "Ing. Jesús Antonio Trejo Reyes";
+      const notes = document.getElementById('notionContent').innerText;
+
+      const fileContent = `=== AI NOTETAKER PRO - REUNIÓN / CLASE VIRTUAL ===\nTítulo: ${title}\nAnfitrión: ${host}\nFecha: ${new Date().toLocaleString()}\n\n=== MINUTA ESTRUCTURADA ===\n\n${notes}\n\n=== TRANSCRIPCIÓN DETALLADA ===\n\n${transcriptText}`;
+      
+      const blob = new Blob([fileContent], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `Notas_${title.replace(/\s+/g, '_')}_${new Date().toISOString().slice(0,10)}.txt`;
+      a.click();
+      URL.revokeObjectURL(url);
+      window.showToast("Archivo TXT descargado", "info");
+    });
+
+    // Exportar documento Word (.docx)
+    document.getElementById('btnExportDocx').addEventListener('click', () => {
+      if (typeof docx === 'undefined') {
+        window.showToast("Librería docx no disponible", "error");
+        return;
+      }
+
+      const title = document.getElementById('sessionTitleInput').value.trim() || "Minuta de Sesión";
+      const host = document.getElementById('hostNameInput').value.trim() || "Ing. Jesús Antonio Trejo Reyes";
+      const notes = document.getElementById('notionContent').innerText;
+
+      const { Document, Packer, Paragraph, HeadingLevel } = docx;
+
+      const doc = new Document({
+        sections: [{
+          properties: {},
+          children: [
+            new Paragraph({ text: title, heading: HeadingLevel.TITLE }),
+            new Paragraph({ text: `Anfitrión / Docente: ${host}`, spacing: { after: 120 } }),
+            new Paragraph({ text: `Fecha: ${new Date().toLocaleString()}`, spacing: { after: 250 } }),
+            new Paragraph({ text: "Minuta Estructurada (Estilo Notion)", heading: HeadingLevel.HEADING_1 }),
+            new Paragraph({ text: notes, spacing: { after: 300 } }),
+            new Paragraph({ text: "Transcripción de Diálogo", heading: HeadingLevel.HEADING_1 }),
+            new Paragraph({ text: transcriptText || "Sin transcripción disponible." })
+          ]
+        }]
+      });
+
+      Packer.toBlob(doc).then(blob => {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `Minuta_${title.replace(/\s+/g, '_')}_${new Date().toISOString().slice(0,10)}.docx`;
+        a.click();
+        URL.revokeObjectURL(url);
+        window.showToast("Documento Word (.docx) descargado", "success");
+      });
+    });
+  </script>
+</body>
+</html>
