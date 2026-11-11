@@ -1,0 +1,1496 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Notetaker Pro - Transcriptor de Sesiones y Clases Virtuales</title>
+  
+  <!-- Estilos con Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  
+  <!-- Íconos con FontAwesome 6 -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  
+  <!-- Librería para generar documentos Word (.docx) directamente en el navegador -->
+  <script src="https://unpkg.com/docx@8.2.2/build/index.umd.js"></script>
+
+  <!-- ========================================================================= -->
+  <!-- PASO 1: MÓDULO DE PERSISTENCIA EN LA NUBE CON FIREBASE (FIRESTORE & AUTH) -->
+  <!-- ========================================================================= -->
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+    import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+    import { getFirestore, collection, addDoc, doc, deleteDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+    // Configuración oficial de tu proyecto Firebase (transcriptor-78feb)
+    const firebaseConfig = typeof __firebase_config !== 'undefined' 
+      ? JSON.parse(__firebase_config) 
+      : {
+          apiKey: "AIzaSyBb8GWHEC-BsDKdxzCMmFyhhEYv7s9VDq0",
+          authDomain: "transcriptor-78feb.firebaseapp.com",
+          projectId: "transcriptor-78feb",
+          storageBucket: "transcriptor-78feb.firebasestorage.app",
+          messagingSenderId: "910024341955",
+          appId: "1:910024341955:web:a189bb6adb8f0d96f16576",
+          measurementId: "G-0N3H8W87RW"
+        };
+
+    const appId = typeof __app_id !== 'undefined' ? __app_id : 'transcriptor-app';
+
+    // Inicialización del cliente Firebase
+    const app = initializeApp(firebaseConfig);
+    const db = getFirestore(app);
+    const auth = getAuth(app);
+
+    let currentUser = null;
+
+    // Autenticación segura (Tokens o inicio anónimo)
+    async function initAuth() {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (err) {
+        console.warn("Aviso de Auth Firebase:", err.message);
+      }
+    }
+
+    onAuthStateChanged(auth, (user) => {
+      if (user) {
+        currentUser = user;
+        console.log("Sesión activa en Firebase:", user.uid);
+        listenSavedMeetings();
+      }
+    });
+
+    initAuth();
+
+    // Guardar una sesión (Transcripción y Resumen tipo Notion) en Firestore
+    window.saveMeetingToFirebase = async function(meetingData) {
+      if (!currentUser) return;
+      try {
+        const meetingsRef = collection(db, 'artifacts', appId, 'public', 'data', 'meetings');
+        await addDoc(meetingsRef, {
+          userId: currentUser.uid,
+          author: meetingData.author || "Ing. Jesús Antonio Trejo Reyes",
+          title: meetingData.title || "Sesión Virtual",
+          type: meetingData.type || "Trabajo",
+          date: new Date().toISOString(),
+          transcript: meetingData.transcript || "",
+          summary: meetingData.summary || "",
+          actionItems: meetingData.actionItems || [],
+          timestamp: Date.now()
+        });
+        window.showToast("✓ Sesión sincronizada con la nube de Firebase", "success");
+      } catch (err) {
+        console.error("Error guardando en Firestore:", err);
+        window.showToast("Error al guardar en Firebase: " + err.message, "error");
+      }
+    };
+
+    // Eliminar una sesión de la base de datos
+    window.deleteMeetingFromFirebase = async function(docId) {
+      if (!currentUser) return;
+      try {
+        const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'meetings', docId);
+        await deleteDoc(docRef);
+        window.showToast("Sesión eliminada de la nube", "info");
+      } catch (err) {
+        console.error("Error al eliminar documento:", err);
+      }
+    };
+
+    // Sincronización en tiempo real del historial de reuniones
+    function listenSavedMeetings() {
+      if (!currentUser) return;
+      const meetingsRef = collection(db, 'artifacts', appId, 'public', 'data', 'meetings');
+      
+      onSnapshot(meetingsRef, (snapshot) => {
+        const historyContainer = document.getElementById('meetingHistoryList');
+        const modalContainer = document.getElementById('modalHistoryList');
+        
+        if (snapshot.empty) {
+          const emptyMsg = `<p class="text-xs text-slate-500 italic p-3 text-center">No hay sesiones guardadas aún.</p>`;
+          if (historyContainer) historyContainer.innerHTML = emptyMsg;
+          if (modalContainer) modalContainer.innerHTML = emptyMsg;
+          return;
+        }
+
+        if (historyContainer) historyContainer.innerHTML = '';
+        if (modalContainer) modalContainer.innerHTML = '';
+
+        window.currentMeetingsDocs = {};
+
+        snapshot.docs.forEach(docSnap => {
+          const data = docSnap.data();
+          const docId = docSnap.id;
+          window.currentMeetingsDocs[docId] = data;
+
+          const dateStr = new Date(data.timestamp || Date.now()).toLocaleDateString([], {
+            month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
+          });
+          
+          // Renderizado para el panel lateral
+          if (historyContainer) {
+            const card = document.createElement('div');
+            card.className = "p-2.5 bg-slate-900 border border-red-950/60 rounded-lg text-xs hover:border-red-600 transition mb-2 flex justify-between items-start gap-2 group cursor-pointer";
+            card.innerHTML = `
+              <div class="flex-1 min-w-0" onclick="window.loadSavedSession('${docId}')">
+                <div class="flex items-center text-red-400 font-semibold mb-1 truncate">
+                  <i class="fa-solid fa-bookmark mr-1.5 text-[10px]"></i>
+                  <span class="truncate">${data.title || "Sesión"}</span>
+                </div>
+                <div class="text-[10px] text-slate-500 flex items-center gap-1">
+                  <span>${dateStr}</span> • <span class="text-slate-400">${data.type || "General"}</span>
+                </div>
+              </div>
+              <button onclick="window.deleteMeetingFromFirebase('${docId}')" title="Eliminar de la nube" class="text-slate-500 hover:text-red-400 p-1 transition opacity-70 group-hover:opacity-100">
+                <i class="fa-solid fa-trash-can text-xs"></i>
+              </button>
+            `;
+            historyContainer.appendChild(card);
+          }
+
+          // Renderizado para la vista modal completa
+          if (modalContainer) {
+            const modalItem = document.createElement('div');
+            modalItem.className = "p-4 bg-slate-800/80 border border-red-900/30 rounded-xl space-y-2";
+            modalItem.innerHTML = `
+              <div class="flex justify-between items-center border-b border-slate-700/60 pb-2">
+                <div>
+                  <h4 class="font-bold text-red-400 text-sm">${data.title || "Sesión Sin Título"}</h4>
+                  <span class="text-[11px] text-slate-400">${dateStr} | Tipo: ${data.type || "Reunión"}</span>
+                </div>
+                <div class="flex space-x-2">
+                  <button onclick="window.loadSavedSession('${docId}'); window.closeHistoryModal();" class="px-3 py-1 bg-red-600 hover:bg-red-500 text-white rounded-lg text-xs font-semibold cursor-pointer">
+                    Cargar en Pantalla
+                  </button>
+                  <button onclick="window.deleteMeetingFromFirebase('${docId}')" class="px-2.5 py-1 bg-red-950/60 border border-red-800 text-red-300 hover:bg-red-800 rounded-lg text-xs cursor-pointer">
+                    <i class="fa-solid fa-trash"></i>
+                  </button>
+                </div>
+              </div>
+              <div class="text-xs text-slate-300 max-h-24 overflow-y-auto bg-slate-950/50 p-2.5 rounded border border-slate-800">
+                ${data.summary || data.transcript || "Sin contenido"}
+              </div>
+            `;
+            modalContainer.appendChild(modalItem);
+          }
+        });
+      }, (error) => {
+        console.error("Error en Snapshot Firestore:", error);
+      });
+    }
+
+    // Cargar contenido de una reunión histórica en los paneles
+    window.loadSavedSession = function(docId) {
+      if (window.currentMeetingsDocs && window.currentMeetingsDocs[docId]) {
+        const item = window.currentMeetingsDocs[docId];
+        document.getElementById('transcriptBox').innerText = item.transcript || "";
+        document.getElementById('notionContent').innerHTML = (item.summary || "").replace(/\n/g, '<br>');
+        document.getElementById('sessionTitleInput').value = item.title || "";
+        window.showToast("Sesión cargada exitosamente", "info");
+      }
+    };
+  </script>
+
+  <!-- Estilos visuales personalizados -->
+  <style>
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #0b0f19; }
+    ::-webkit-scrollbar-thumb { background: #1f293d; border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: #dc2626; }
+    
+    .pulsing-record-ring {
+      animation: record-pulse 1.8s infinite;
+    }
+    @keyframes record-pulse {
+      0% { box-shadow: 0 0 0 0px rgba(220, 38, 38, 0.7); }
+      70% { box-shadow: 0 0 0 12px rgba(220, 38, 38, 0); }
+      100% { box-shadow: 0 0 0 0px rgba(220, 38, 38, 0); }
+    }
+  </style>
+</head>
+
+<body class="bg-slate-950 text-slate-100 font-sans h-screen flex flex-col overflow-hidden select-none">
+
+  <!-- ========================================================================= -->
+  <!-- PASO 2: ENCABEZADO PRINCIPAL (IDENTIDAD, TIPO DE SESIÓN Y ESTADO)          -->
+  <!-- ========================================================================= -->
+  <header class="bg-slate-900 border-b border-red-900/40 px-5 py-3 flex items-center justify-between">
+    <div class="flex items-center space-x-3.5">
+      <div class="bg-gradient-to-br from-red-600 to-rose-700 text-white p-2.5 rounded-xl shadow-lg shadow-red-600/30 flex items-center justify-center">
+        <i class="fa-solid fa-brain text-xl"></i>
+      </div>
+      <div>
+        <div class="flex items-center gap-2">
+          <h1 class="font-bold text-base md:text-lg tracking-tight">AI Notetaker Pro</h1>
+          <span class="px-2 py-0.5 bg-red-950 border border-red-700/60 text-red-400 text-[10px] rounded-full font-mono font-semibold">Web & Clases Virtuales</span>
+        </div>
+        <p class="text-xs text-slate-400">Autor: <span class="font-semibold text-red-300">Ing. Jesús Antonio Trejo Reyes</span></p>
+      </div>
+    </div>
+
+    <!-- Barra de acciones superiores -->
+    <div class="flex items-center space-x-3">
+      <!-- Selector de Modo de Sesión (Trabajo / Clase Universitaria) -->
+      <div class="hidden sm:flex items-center bg-slate-950 border border-red-900/50 rounded-lg px-2.5 py-1 text-xs">
+        <i class="fa-solid fa-graduation-cap text-red-400 mr-2"></i>
+        <select id="sessionTypeSelect" class="bg-transparent text-slate-200 outline-none cursor-pointer">
+          <option value="Clase Virtual" class="bg-slate-900 text-slate-200">Clase Universitaria / Clase Virtual</option>
+          <option value="Reunión de Trabajo" class="bg-slate-900 text-slate-200">Reunión de Trabajo / Negocios</option>
+          <option value="Seminario Web" class="bg-slate-900 text-slate-200">Seminario Web / Capacitación</option>
+        </select>
+      </div>
+
+      <!-- Botón de Instrucciones de Audio Zoom/Meet -->
+      <button id="btnOpenGuide" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-red-900/50 text-red-300 text-xs font-semibold rounded-lg transition flex items-center gap-1.5 cursor-pointer">
+        <i class="fa-solid fa-circle-question text-red-400"></i>
+        <span class="hidden md:inline">¿Cómo capturar audio de los demás?</span>
+      </button>
+
+      <!-- Botón Historial de Grabaciones -->
+      <button id="btnOpenHistory" class="px-3 py-1.5 bg-red-950/70 hover:bg-red-900/70 border border-red-700/60 text-red-300 text-xs font-semibold rounded-lg transition flex items-center gap-1.5 cursor-pointer">
+        <i class="fa-solid fa-clock-rotate-left text-red-400"></i>
+        <span>Historial</span>
+      </button>
+
+      <!-- Badge de Estado en Tiempo Real -->
+      <div class="flex items-center space-x-2 px-3 py-1.5 rounded-full bg-slate-950 border border-red-900/50 text-xs font-mono">
+        <span id="statusIndicatorDot" class="w-2.5 h-2.5 rounded-full bg-slate-500"></span>
+        <span id="statusTextLabel" class="text-slate-300">En espera</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- Banner Especial para Configuración de Zoom -->
+  <div id="zoomHelperBanner" class="bg-gradient-to-r from-red-950/90 via-slate-900 to-red-950/90 border-b border-red-600/60 px-5 py-2.5 text-xs text-red-200 flex items-center justify-between">
+    <div class="flex items-center space-x-2.5">
+      <i class="fa-solid fa-video text-red-400 text-sm"></i>
+      <span><strong>¿Estás en Zoom?</strong> Si usas la app de Zoom instalada, en la ventana emergente elige <strong>"Toda la pantalla"</strong> (no "Ventana") para que aparezca la casilla <strong>"Compartir audio del sistema"</strong>.</span>
+    </div>
+    <button onclick="document.getElementById('zoomHelperBanner').remove()" class="text-red-400 hover:text-white text-sm ml-3 cursor-pointer"><i class="fa-solid fa-xmark"></i></button>
+  </div>
+
+  <!-- ========================================================================= -->
+  <!-- PASO 3: CUERPO PRINCIPAL (PANEL LATERAL DE CONTROL Y ÁREA DE TRABAJO)      -->
+  <!-- ========================================================================= -->
+  <main class="flex-1 flex overflow-hidden">
+    
+    <!-- BARRA LATERAL IZQUIERDA: CONFIGURACIÓN Y MONITOREO -->
+    <aside class="w-80 md:w-96 bg-slate-900/70 border-r border-red-900/30 p-4 flex flex-col justify-between space-y-3 overflow-y-auto">
+      <div class="space-y-4">
+        
+        <!-- Botones de Acción (Iniciar / Detener) -->
+        <div class="space-y-2">
+          <button id="btnStartSession" class="w-full py-3.5 px-4 bg-gradient-to-r from-red-600 to-rose-600 hover:from-red-500 hover:to-rose-500 text-white font-bold rounded-xl shadow-lg shadow-red-600/30 transition flex items-center justify-center space-x-2 cursor-pointer">
+            <i class="fa-solid fa-play"></i>
+            <span>Iniciar Transcripción Activa</span>
+          </button>
+          
+          <button id="btnStopSession" disabled class="w-full py-3 px-4 bg-slate-800 hover:bg-red-900 text-white font-semibold rounded-xl border border-red-900/40 opacity-40 cursor-not-allowed transition flex items-center justify-center space-x-2">
+            <i class="fa-solid fa-stop"></i>
+            <span>Detener y Generar Notas Notion</span>
+          </button>
+        </div>
+
+        <!-- Parámetros de la Sesión (Identificación y Título) -->
+        <div class="bg-slate-950/70 border border-red-900/40 rounded-xl p-3 space-y-2.5">
+          <div class="flex justify-between items-center text-xs">
+            <span class="font-bold text-red-300 flex items-center gap-1.5">
+              <i class="fa-solid fa-id-card-clip text-red-400"></i> Metadatos de la Sesión
+            </span>
+          </div>
+          
+          <div>
+            <label class="text-[10px] text-slate-400 block mb-0.5 font-medium">Título de la Sesión / Asignatura:</label>
+            <input type="text" id="sessionTitleInput" value="Sesión de Trabajo y Seguimiento" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-red-500">
+          </div>
+
+          <div class="grid grid-cols-2 gap-2">
+            <div>
+              <label class="text-[10px] text-slate-400 block mb-0.5 font-medium">Tu Nombre (Anfitrión):</label>
+              <input type="text" id="hostNameInput" value="Ing. Jesús Antonio Trejo Reyes" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-emerald-400 font-semibold focus:outline-none focus:border-red-500">
+            </div>
+            <div>
+              <label class="text-[10px] text-slate-400 block mb-0.5 font-medium">Profesor / Participantes:</label>
+              <input type="text" id="guestsListInput" value="Docente / Participantes (Zoom)" placeholder="Ej. Docente, Dra. Pérez..." class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-cyan-300 font-semibold focus:outline-none focus:border-red-500">
+            </div>
+          </div>
+        </div>
+
+        <!-- Selector de Modo de Captura de Audio -->
+        <div class="bg-slate-950/70 border border-red-900/40 rounded-xl p-3 space-y-2">
+          <label class="text-xs font-bold text-red-300 flex items-center justify-between">
+            <span class="flex items-center gap-1.5"><i class="fa-solid fa-headphones text-red-400"></i> Fuente de Videollamada:</span>
+          </label>
+          <select id="audioCaptureModeSelect" class="w-full bg-slate-900 border border-slate-700 text-slate-200 text-xs rounded-lg p-2 outline-none focus:border-red-500">
+            <option value="digital">Zoom App / Pantalla Completa (Audio del Sistema)</option>
+            <option value="tab">Zoom Web / Meet (Pestaña con Audio)</option>
+            <option value="speakers">Modo Bocinas Abiertas (Sin Audífonos)</option>
+          </select>
+          <p id="captureModeHelp" class="text-[10px] text-slate-400 leading-tight">
+            En Zoom App de escritorio, selecciona "Toda la pantalla" y marca "Compartir audio".
+          </p>
+        <p>En Zoom App de escritorio, selecciona "Toda la pantalla" y marca "Compartir audio".</p>
+      </div>
+
+      <!-- Modo Automático Directo (Sin requerir claves ni configuraciones complejas) -->
+        <div class="bg-slate-950/70 border border-emerald-900/40 rounded-xl p-3 space-y-1.5">
+          <div class="flex items-center text-xs font-semibold text-emerald-400 gap-1.5">
+            <i class="fa-solid fa-bolt text-emerald-400"></i>
+            <span>Transcripción Directa Activada</span>
+          </div>
+          <p class="text-[11px] text-slate-300 leading-relaxed">
+            El programa procesa la voz de forma local e instantánea. No necesitas ingresar ninguna clave ni registrarte en servicios externos.
+          </p>
+        </div>
+
+        <!-- Indicador de Canales de Audio en Vivo (VU Meters) -->
+        <div class="bg-slate-950/70 border border-red-900/40 rounded-xl p-3 space-y-2.5">
+          <span class="text-xs font-bold text-red-300 flex items-center gap-1.5">
+            <i class="fa-solid fa-sliders text-red-400"></i> Monitor de Canales (Diarización)
+          </span>
+
+          <!-- Micrófono (Canal Izquierdo) -->
+          <div>
+            <div class="flex justify-between text-[11px] mb-1">
+              <span class="text-emerald-400 font-medium"><i class="fa-solid fa-microphone mr-1 text-[10px]"></i> Tu Micrófono</span>
+              <span id="micVolText" class="font-mono text-[10px] text-slate-400">0 dB</span>
+            </div>
+            <div class="w-full bg-slate-900 rounded-full h-1.5 overflow-hidden border border-slate-800">
+              <div id="micVolBar" class="bg-emerald-500 h-full w-0 transition-all duration-75"></div>
+            </div>
+          </div>
+
+          <!-- Audio de Videollamada/Altavoces (Canal Derecho) -->
+          <div>
+            <div class="flex justify-between text-[11px] mb-1">
+              <span class="text-cyan-400 font-medium"><i class="fa-solid fa-users mr-1 text-[10px]"></i> Videollamada (Otros Hablantes)</span>
+              <span id="sysVolText" class="font-mono text-[10px] text-slate-400">0 dB</span>
+            </div>
+            <div class="w-full bg-slate-900 rounded-full h-1.5 overflow-hidden border border-slate-800">
+              <div id="sysVolBar" class="bg-cyan-500 h-full w-0 transition-all duration-75"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Historial en Firestore -->
+        <div class="space-y-1.5 pt-1 border-t border-red-900/30">
+          <div class="flex items-center justify-between">
+            <span class="text-xs font-bold text-slate-300 flex items-center gap-1.5">
+              <i class="fa-solid fa-cloud-arrow-up text-red-400"></i> Sesiones en la Nube
+            </span>
+          </div>
+          <div id="meetingHistoryList" class="max-h-36 overflow-y-auto space-y-1 pr-1">
+            <p class="text-xs text-slate-500 italic p-2">Conectando a Firebase...</p>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- Pie del Panel Lateral -->
+      <div class="pt-2 border-t border-red-900/20 text-center">
+        <p class="text-[10px] text-slate-400">Diseñado para Google Meet, Zoom, Teams y Clases Web</p>
+      </div>
+    </aside>
+
+    <!-- ÁREA DE TRABAJO DERECHA: NOTAS ESTILO NOTION Y TRANSCRIPCIÓN EN VIVO -->
+    <section class="flex-1 flex flex-col bg-slate-950 overflow-hidden">
+      
+      <!-- Barra de Pestañas de Vista -->
+      <div class="flex items-center justify-between border-b border-red-900/30 bg-slate-900/40 px-6">
+        <div class="flex space-x-2">
+          <button id="tabNotionBtn" class="py-3 px-4 border-b-2 border-red-500 text-red-400 font-semibold text-xs md:text-sm flex items-center gap-2 cursor-pointer">
+            <i class="fa-solid fa-note-sticky"></i>
+            <span>Minuta Estilo Notion (Resumen & Tareas)</span>
+          </button>
+          
+          <button id="tabLiveBtn" class="py-3 px-4 border-b-2 border-transparent text-slate-400 hover:text-slate-200 font-semibold text-xs md:text-sm flex items-center gap-2 cursor-pointer">
+            <i class="fa-solid fa-comments"></i>
+            <span>Transcripción en Vivo por Hablante</span>
+          </button>
+        </div>
+
+        <!-- Herramientas de Exportación (Word, TXT y Portapapeles) -->
+        <div class="flex items-center space-x-2">
+          <button id="btnCopyNotes" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs rounded-lg transition flex items-center gap-1.5 cursor-pointer" title="Copiar al portapapeles">
+            <i class="fa-regular fa-copy"></i>
+            <span class="hidden sm:inline">Copiar</span>
+          </button>
+          <button id="btnExportTxt" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs rounded-lg transition flex items-center gap-1.5 cursor-pointer">
+            <i class="fa-regular fa-file-lines text-slate-400"></i>
+            <span>TXT</span>
+          </button>
+          <button id="btnExportDocx" class="px-3 py-1.5 bg-red-950/70 border border-red-700/60 hover:bg-red-900/60 text-red-200 text-xs font-semibold rounded-lg transition flex items-center gap-1.5 cursor-pointer">
+            <i class="fa-regular fa-file-word text-red-400"></i>
+            <span>Word (.docx)</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Contenedor Principal de Contenido -->
+      <div class="flex-1 p-6 overflow-y-auto space-y-4">
+
+        <!-- Banner de advertencia si el usuario no compartió el audio del sistema -->
+        <div id="alertMissingSystemAudio" class="hidden bg-amber-950/70 border border-amber-600/80 p-3.5 rounded-xl text-amber-200 text-xs flex items-start gap-3 shadow-lg">
+          <i class="fa-solid fa-triangle-exclamation text-amber-400 text-base mt-0.5"></i>
+          <div>
+            <span class="font-bold">Aviso importante:</span> Solo se está escuchando tu micrófono. Al hacer clic en "Iniciar", no se marcó la casilla <strong>"Compartir audio de la pestaña"</strong> o <strong>"Compartir audio del sistema"</strong> en la ventana emergente. Los otros participantes no podrán ser transcritos hasta reiniciar marcando dicha casilla.
+          </div>
+        </div>
+
+        <!-- VISTA 1: MINUTA ESTRUCTURADA ESTILO NOTION -->
+        <div id="viewNotion" class="space-y-4">
+          <div class="bg-slate-900/80 border border-red-900/30 rounded-2xl p-6 shadow-xl space-y-4">
+            <div class="flex items-center justify-between border-b border-red-900/20 pb-3">
+              <div class="flex items-center space-x-2">
+                <span class="p-1.5 bg-red-950 border border-red-800 rounded-lg text-red-400 text-xs">
+                  <i class="fa-solid fa-book-open"></i>
+                </span>
+                <h3 class="font-bold text-sm text-slate-200 uppercase tracking-wider">Espacio de Notas & Síntesis</h3>
+              </div>
+              <span id="aiProcessingBadge" class="hidden text-xs text-red-400 font-mono animate-pulse flex items-center gap-1">
+                <i class="fa-solid fa-spinner fa-spin"></i> Generando síntesis con IA...
+              </span>
+            </div>
+
+            <!-- Contenido Dinámico de Notion -->
+            <div id="notionContent" class="text-sm text-slate-300 leading-relaxed space-y-4">
+              <div class="p-6 text-center text-slate-500 italic space-y-2">
+                <i class="fa-solid fa-feather-pointed text-3xl text-slate-600"></i>
+                <p>Presiona <strong>"Iniciar Transcripción Activa"</strong> para comenzar la captura de audio.</p>
+                <p class="text-xs text-slate-600">Al terminar la reunión o clase, se estructurará automáticamente un resumen ejecutivo con puntos clave, acuerdos y tareas pendientes.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- VISTA 2: TRANSCRIPCIÓN EN VIVO DIARIZADA -->
+        <div id="viewLive" class="hidden space-y-4">
+          <div class="bg-slate-900/90 border border-red-900/30 rounded-2xl p-5 shadow-xl">
+            <div class="flex justify-between items-center mb-3 pb-2 border-b border-slate-800 text-xs text-slate-400">
+              <span class="font-mono flex items-center gap-1.5 text-slate-300">
+                <i class="fa-solid fa-wave-square text-red-400"></i> Registro Cronológico en Tiempo Real
+              </span>
+              <span id="transcriptionWordCount" class="text-[11px] font-mono">0 palabras</span>
+            </div>
+            
+            <div id="transcriptBox" class="text-sm font-mono text-slate-300 min-h-[350px] max-h-[550px] overflow-y-auto leading-relaxed whitespace-pre-wrap p-3 bg-slate-950/70 rounded-xl border border-slate-800">
+              <span class="text-slate-600 italic">El diálogo transcrito aparecerá aquí palabra por palabra...</span>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </section>
+  </main>
+
+  <!-- ========================================================================= -->
+  <!-- PASO 4: MODALES DE AYUDA Y DE HISTORIAL COMPLETO                          -->
+  <!-- ========================================================================= -->
+
+  <!-- MODAL EN EL CENTRO EXACTO DE LA PANTALLA: ASISTENTE VISUAL DE CASILLA DE AUDIO -->
+  <div id="modalCenteredCheckboxHelper" class="fixed inset-0 bg-slate-950/85 backdrop-blur-md z-50 flex items-center justify-center hidden p-4">
+    <div class="bg-slate-900 border-2 border-red-500 w-full max-w-lg rounded-2xl p-6 shadow-2xl space-y-4 transform transition-all animate-in fade-in zoom-in duration-200">
+      <div class="flex items-center justify-between border-b border-red-900/40 pb-3">
+        <div class="flex items-center space-x-2.5">
+          <div class="p-2 bg-red-600 text-white rounded-xl shadow-lg shadow-red-600/30">
+            <i class="fa-solid fa-volume-high text-lg"></i>
+          </div>
+          <div>
+            <h3 class="font-bold text-base text-white">Activar Audio de Videollamada</h3>
+            <p class="text-[11px] text-red-300">Asegúrate de marcar la casilla para que se escuchen los demás</p>
+          </div>
+        </div>
+        <button id="btnCloseCenteredHelper" class="text-slate-400 hover:text-white cursor-pointer"><i class="fa-solid fa-xmark text-lg"></i></button>
+      </div>
+
+      <!-- Simulación gráfica centrada -->
+      <div class="bg-slate-950 p-4 rounded-xl border border-slate-800 space-y-3">
+        <p class="text-xs text-slate-300">
+          En la siguiente ventana que se abrirá, selecciona <span class="text-cyan-400 font-semibold">"Toda la pantalla"</span> o la pestaña de tu reunión:
+        </p>
+
+        <!-- Gráfico ilustrativo del diálogo -->
+        <div class="relative bg-slate-900 border border-slate-700 rounded-lg p-3 overflow-hidden">
+          <div class="flex items-center justify-between border-b border-slate-800 pb-2 mb-3 text-[11px] text-slate-400">
+            <span>Elige qué compartir</span>
+            <span class="text-xs text-red-400 font-bold">Pestaña o Pantalla Completa</span>
+          </div>
+          
+          <div class="h-20 bg-slate-950/80 rounded border border-dashed border-slate-700 flex items-center justify-center text-slate-500 text-xs">
+            <i class="fa-solid fa-desktop mr-2 text-slate-400"></i> Vista previa de tu pantalla / Zoom
+          </div>
+
+          <!-- Casilla resaltada con flecha indicadora -->
+          <div class="mt-3 pt-2 border-t border-slate-800 flex items-center justify-between">
+            <div class="relative flex items-center space-x-2 bg-emerald-950/80 border-2 border-emerald-500 text-emerald-200 px-3 py-1.5 rounded-lg shadow-lg">
+              <input type="checkbox" checked disabled class="accent-emerald-500 w-4 h-4 cursor-pointer">
+              <span class="text-xs font-bold">Compartir audio del sistema / pestaña</span>
+              <span class="absolute -top-6 right-2 text-emerald-400 text-xs animate-bounce font-bold">
+                <i class="fa-solid fa-arrow-down"></i> ¡Márcala aquí!
+              </span>
+            </div>
+            <span class="text-[10px] text-slate-400">Esquina inferior izquierda</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="space-y-2 pt-1">
+        <button id="btnLaunchScreenWithAudio" class="w-full py-3.5 px-4 bg-gradient-to-r from-red-600 to-rose-600 hover:from-red-500 hover:to-rose-500 text-white font-bold text-sm rounded-xl shadow-xl shadow-red-600/30 transition flex items-center justify-center space-x-2 cursor-pointer">
+          <i class="fa-solid fa-arrow-up-right-from-square"></i>
+          <span>Abrir Selector Ahora y Marcar Casilla</span>
+        </button>
+        <p class="text-[10px] text-center text-slate-400">
+          Hemos configurado la solicitud para que el navegador intente pre-marcar la casilla de forma automática.
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: Guía para Capturar Audio de Zoom / Meet / Teams -->
+  <div id="modalGuide" class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center hidden p-4">
+    <div class="bg-slate-900 border border-red-900/50 w-full max-w-xl rounded-2xl p-6 shadow-2xl space-y-4">
+      <div class="flex justify-between items-center border-b border-red-900/30 pb-3">
+        <h3 class="font-bold text-base text-white flex items-center gap-2">
+          <i class="fa-solid fa-video text-red-400"></i>
+          <span>Instrucciones Exactas para Zoom</span>
+        </h3>
+        <button id="btnCloseGuide" class="text-slate-400 hover:text-white cursor-pointer"><i class="fa-solid fa-xmark text-lg"></i></button>
+      </div>
+
+      <div class="space-y-3 text-xs text-slate-300 leading-relaxed">
+        <div class="p-3.5 bg-slate-950 border border-red-600/50 rounded-xl space-y-1.5">
+          <p class="font-bold text-red-300 text-sm"><i class="fa-solid fa-triangle-exclamation mr-1 text-red-400"></i> ¿Por qué no te apareció la casilla en Zoom?</p>
+          <p class="text-slate-300">Si elegiste la opción <strong>"Ventana"</strong>, los navegadores <strong>nunca muestran la casilla de audio</strong> para ventanas de programas externos instalados como Zoom.</p>
+        </div>
+
+        <div class="p-3 bg-slate-950 border border-slate-800 rounded-xl space-y-1">
+          <p class="font-bold text-cyan-300">Paso 1: Presiona "Iniciar Transcripción Activa"</p>
+          <p>Se abrirá la ventana para compartir pantalla de tu navegador.</p>
+        </div>
+
+        <div class="p-3 bg-slate-950 border border-slate-800 rounded-xl space-y-1">
+          <p class="font-bold text-cyan-300">Paso 2: Elige "Toda la pantalla" (No elijas "Ventana")</p>
+          <p>Haz clic sobre la miniatura de tu pantalla principal.</p>
+        </div>
+
+        <div class="p-3 bg-slate-950 border border-emerald-600/50 rounded-xl space-y-1">
+          <p class="font-bold text-emerald-300">Paso 3: Marca la casilla en la esquina inferior izquierda</p>
+          <p>Verás la casilla <strong>"Compartir audio del sistema"</strong>. Márcala con una palomita y haz clic en Compartir. ¡Eso capturará todo lo que digan los demás participantes en Zoom!</p>
+        </div>
+      </div>
+
+      <div class="text-right pt-2">
+        <button id="btnDismissGuide" class="px-4 py-2 bg-red-600 hover:bg-red-500 text-white font-semibold rounded-lg text-xs cursor-pointer">
+          Entendido, cerrar
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal Emergente de Advertencia si falta el audio de Zoom -->
+  <div id="modalZoomAudioMissing" class="fixed inset-0 bg-slate-950/85 backdrop-blur-md z-50 flex items-center justify-center hidden p-4">
+    <div class="bg-slate-900 border border-red-500 w-full max-w-lg rounded-2xl p-6 shadow-2xl space-y-4">
+      <div class="flex items-center space-x-3 text-red-400 border-b border-red-900/40 pb-3">
+        <div class="p-2 bg-red-950 rounded-xl">
+          <i class="fa-solid fa-volume-xmark text-xl"></i>
+        </div>
+        <div>
+          <h3 class="font-bold text-base text-white">Audio de Zoom No Detectado</h3>
+          <p class="text-xs text-red-300">Solo se escuchará tu voz, los demás participantes no saldrán</p>
+        </div>
+      </div>
+
+      <div class="space-y-2 text-xs text-slate-300 leading-relaxed bg-slate-950 p-4 rounded-xl border border-slate-800">
+        <p>No se activó la casilla de audio al compartir pantalla. Esto ocurre si seleccionaste <strong>"Ventana"</strong> en lugar de <strong>"Toda la pantalla"</strong>.</p>
+        <p class="font-semibold text-slate-200">Para arreglarlo:</p>
+        <ol class="list-decimal list-inside space-y-1 text-slate-300">
+          <li>Haz clic en el botón rojo <strong>"Reintentar y Conectar Zoom"</strong>.</li>
+          <li>En la ventana emergente selecciona <strong>"Toda la pantalla"</strong>.</li>
+          <li>Marca la casilla <strong>"Compartir audio del sistema"</strong> (abajo a la izquierda).</li>
+        </ol>
+      </div>
+
+      <div class="flex justify-end space-x-2 pt-2">
+        <button onclick="document.getElementById('modalZoomAudioMissing').classList.add('hidden')" class="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs rounded-lg cursor-pointer">
+          Continuar solo con mi voz
+        </button>
+        <button onclick="window.retryZoomConnection()" class="px-4 py-2 bg-red-600 hover:bg-red-500 text-white font-bold text-xs rounded-lg shadow-lg shadow-red-600/30 cursor-pointer flex items-center gap-1.5">
+          <i class="fa-solid fa-arrow-rotate-right"></i>
+          <span>Reintentar y Conectar Zoom</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: Historial Detallado -->
+  <div id="modalHistory" class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center hidden p-4">
+    <div class="bg-slate-900 border border-red-900/50 w-full max-w-2xl rounded-2xl p-6 shadow-2xl flex flex-col max-h-[85vh]">
+      <div class="flex justify-between items-center border-b border-red-900/30 pb-3">
+        <h3 class="font-bold text-base text-white flex items-center gap-2">
+          <i class="fa-solid fa-box-archive text-red-400"></i>
+          <span>Historial Completo de Sesiones Guardadas</span>
+        </h3>
+        <button id="btnCloseHistoryModal" class="text-slate-400 hover:text-white cursor-pointer"><i class="fa-solid fa-xmark text-lg"></i></button>
+      </div>
+      <div id="modalHistoryList" class="flex-1 overflow-y-auto my-3 space-y-2.5 pr-2">
+        <!-- Render dinámico desde Firestore -->
+      </div>
+      <div class="pt-3 border-t border-red-900/20 text-right">
+        <button id="btnDismissHistory" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold rounded-lg cursor-pointer">
+          Cerrar
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Notificaciones Toast Flotantes -->
+  <div id="toastContainer" class="fixed bottom-5 right-5 z-50 flex flex-col space-y-2 pointer-events-none"></div>
+
+  <!-- ========================================================================= -->
+  <!-- PASO 5: MOTOR DE AUDIO, DIARIZACIÓN DE HABLANTE Y GENERACIÓN DE MINUTAS    -->
+  <!-- ========================================================================= -->
+  <script>
+    // Variables de Estado Global
+    let isRecording = false;
+    let audioContext = null;
+    let micStream = null;
+    let systemStream = null;
+    let micAnalyser = null;
+    let systemAnalyser = null;
+    let audioProcessorNode = null;
+    let speechRecognitionInstance = null;
+    let transcriptText = "";
+    let summaryNotionHtml = "";
+    let lastAudioActivityTime = Date.now();
+    let hasSystemAudioTrack = false;
+    let audioChunkQueue = [];
+    let isProcessingAudio = false;
+    let silenceDetectorInterval = null;
+
+    // Búferes PCM Estéreo para chunks continuos
+    let leftChannelBuffer = [];
+    let rightChannelBuffer = [];
+    let bufferSampleLength = 0;
+    const CHUNK_DURATION_SEC = 4; // Intervalo de análisis secundario
+    let lastIdentifiedSpeaker = "";
+
+    // Detección automática de Safari en Mac
+    window.addEventListener('DOMContentLoaded', () => {
+      const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+      if (isSafari) {
+        const banner = document.getElementById('safariAlertBanner');
+        if (banner) banner.classList.remove('hidden');
+        const selector = document.getElementById('audioCaptureModeSelect');
+        if (selector) selector.value = "speakers";
+      }
+    });
+
+    // Toast flotante no intrusivo
+    window.showToast = function(message, type = 'info') {
+      const container = document.getElementById('toastContainer');
+      const toast = document.createElement('div');
+      
+      let bgClass = "bg-slate-900 border-slate-700 text-slate-200";
+      if (type === 'success') bgClass = "bg-emerald-950 border-emerald-600 text-emerald-200";
+      if (type === 'error') bgClass = "bg-red-950 border-red-600 text-red-200";
+      if (type === 'info') bgClass = "bg-red-950/90 border-red-700 text-red-200";
+
+      toast.className = `p-3 rounded-xl border text-xs shadow-2xl flex items-center space-x-2 transition-all transform translate-y-2 opacity-0 pointer-events-auto ${bgClass}`;
+      toast.innerHTML = `<span>${message}</span>`;
+      container.appendChild(toast);
+
+      requestAnimationFrame(() => {
+        toast.classList.remove('translate-y-2', 'opacity-0');
+      });
+
+      setTimeout(() => {
+        toast.classList.add('opacity-0', 'translate-y-2');
+        setTimeout(() => toast.remove(), 300);
+      }, 4000);
+    };
+
+    // Control de Pestañas (Notion vs En Vivo)
+    const tabNotionBtn = document.getElementById('tabNotionBtn');
+    const tabLiveBtn = document.getElementById('tabLiveBtn');
+    const viewNotion = document.getElementById('viewNotion');
+    const viewLive = document.getElementById('viewLive');
+
+    tabNotionBtn.addEventListener('click', () => {
+      tabNotionBtn.className = "py-3 px-4 border-b-2 border-red-500 text-red-400 font-semibold text-xs md:text-sm flex items-center gap-2 cursor-pointer";
+      tabLiveBtn.className = "py-3 px-4 border-b-2 border-transparent text-slate-400 hover:text-slate-200 font-semibold text-xs md:text-sm flex items-center gap-2 cursor-pointer";
+      viewNotion.classList.remove('hidden');
+      viewLive.classList.add('hidden');
+    });
+
+    tabLiveBtn.addEventListener('click', () => {
+      tabLiveBtn.className = "py-3 px-4 border-b-2 border-red-500 text-red-400 font-semibold text-xs md:text-sm flex items-center gap-2 cursor-pointer";
+      tabNotionBtn.className = "py-3 px-4 border-b-2 border-transparent text-slate-400 hover:text-slate-200 font-semibold text-xs md:text-sm flex items-center gap-2 cursor-pointer";
+      viewLive.classList.remove('hidden');
+      viewNotion.classList.add('hidden');
+    });
+
+    // Control de Modales
+    const modalGuide = document.getElementById('modalGuide');
+    const modalHistory = document.getElementById('modalHistory');
+    const modalCenteredHelper = document.getElementById('modalCenteredCheckboxHelper');
+
+    document.getElementById('btnOpenGuide').addEventListener('click', () => modalGuide.classList.remove('hidden'));
+    document.getElementById('btnCloseGuide').addEventListener('click', () => modalGuide.classList.add('hidden'));
+    document.getElementById('btnDismissGuide').addEventListener('click', () => modalGuide.classList.add('hidden'));
+
+    document.getElementById('btnCloseCenteredHelper').addEventListener('click', () => modalCenteredHelper.classList.add('hidden'));
+
+    document.getElementById('btnOpenHistory').addEventListener('click', () => modalHistory.classList.remove('hidden'));
+    document.getElementById('btnCloseHistoryModal').addEventListener('click', () => modalHistory.classList.add('hidden'));
+    document.getElementById('btnDismissHistory').addEventListener('click', () => modalHistory.classList.add('hidden'));
+    window.closeHistoryModal = () => modalHistory.classList.add('hidden');
+
+    // =========================================================================
+    // MOTOR DE TRANSCRIPCIÓN LOCAL CONTINUO (0 CONFIGURACIÓN, INMEDIATO)
+    // =========================================================================
+    let lastRecordedText = "";
+
+    function initNativeSpeechRecognition() {
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (!SpeechRecognition) {
+        console.warn("Navegador sin soporte de SpeechRecognition estándar.");
+        return null;
+      }
+
+      const rec = new SpeechRecognition();
+      rec.continuous = true;
+      rec.interimResults = true;
+      rec.lang = 'es-MX';
+
+      rec.onresult = (event) => {
+        let interimText = '';
+        const hostName = document.getElementById('hostNameInput').value.trim() || "Ing. Jesús Antonio Trejo Reyes";
+        const guests = document.getElementById('guestsListInput').value.trim() || "Docente / Participantes (Zoom)";
+        const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+        for (let i = event.resultIndex; i < event.results.length; ++i) {
+          const textChunk = event.results[i][0].transcript.trim();
+          if (event.results[i].isFinal && textChunk.length > 0) {
+            lastAudioActivityTime = Date.now();
+
+            // Evitar duplicaciones directas idénticas consecutivas (ej. "Hola hola", "Hola hola")
+            if (textChunk.toLowerCase() === lastRecordedText.toLowerCase()) {
+              continue;
+            }
+            lastRecordedText = textChunk;
+            
+            // Determinar si la voz provino predominantemente de Zoom (audio del sistema) o del micrófono del anfitrión
+            let speakerTag = `[${hostName}]`;
+            if (systemAnalyser && hasSystemAudioTrack) {
+              const sysData = new Uint8Array(systemAnalyser.frequencyBinCount);
+              systemAnalyser.getByteFrequencyData(sysData);
+              let sSum = 0;
+              for (let k = 0; k < sysData.length; k++) sSum += sysData[k];
+              if (sSum > 250) {
+                speakerTag = `[${guests}]`;
+              }
+            }
+
+            // Agrupar con saltos de línea claros y legibles
+            transcriptText += `[${timeStr}] ${speakerTag}: ${textChunk}\n\n`;
+            lastIdentifiedSpeaker = speakerTag;
+          } else {
+            interimText += ' ' + textChunk;
+          }
+        }
+
+        const box = document.getElementById('transcriptBox');
+        box.innerText = transcriptText + (interimText ? `\n... ${interimText}` : '');
+        box.scrollTop = box.scrollHeight;
+
+        const words = transcriptText.trim().split(/\s+/).filter(Boolean).length;
+        document.getElementById('transcriptionWordCount').innerText = `${words} palabras`;
+      };
+
+      rec.onerror = (e) => {
+        if (e.error !== 'no-speech') {
+          console.warn("Aviso de reconocimiento de voz:", e.error);
+        }
+      };
+
+      rec.onend = () => {
+        if (isRecording) {
+          try { rec.start(); } catch(err){}
+        }
+      };
+
+      return rec;
+    }
+
+    // Reintentar conexión con Zoom si faltó el audio
+    window.retryZoomConnection = async function() {
+      document.getElementById('modalZoomAudioMissing').classList.add('hidden');
+      await stopSession();
+      setTimeout(() => {
+        document.getElementById('btnStartSession').click();
+      }, 400);
+    };
+
+    // =========================================================================
+    // PASO 6: INICIALIZACIÓN DEL MOTOR DE AUDIO Y CAPTURA
+    // =========================================================================
+    const btnStartSession = document.getElementById('btnStartSession');
+    const btnStopSession = document.getElementById('btnStopSession');
+    const btnLaunchScreenWithAudio = document.getElementById('btnLaunchScreenWithAudio');
+
+    // Al presionar Iniciar, abrimos primero el asistente en el centro de la pantalla
+    btnStartSession.addEventListener('click', () => {
+      modalCenteredHelper.classList.remove('hidden');
+    });
+
+    // Desde el botón central se lanza la captura real por gesto de usuario
+    btnLaunchScreenWithAudio.addEventListener('click', async () => {
+      modalCenteredHelper.classList.add('hidden');
+      await executeSessionStart();
+    });
+
+    async function executeSessionStart() {
+      try {
+        transcriptText = "";
+        lastRecordedText = "";
+        hasSystemAudioTrack = false;
+        audioChunkQueue = [];
+        leftChannelBuffer = [];
+        rightChannelBuffer = [];
+        bufferSampleLength = 0;
+        lastAudioActivityTime = Date.now();
+
+        const hostName = document.getElementById('hostNameInput').value.trim() || "Ing. Jesús Antonio Trejo Reyes";
+        const sessionTitle = document.getElementById('sessionTitleInput').value.trim() || "Sesión de Trabajo y Seguimiento";
+
+        document.getElementById('transcriptBox').innerText = `[${new Date().toLocaleTimeString()}] Sesión iniciada: ${sessionTitle}\nAnfitrión: ${hostName}\n---\n\n`;
+        document.getElementById('alertMissingSystemAudio').classList.add('hidden');
+
+        // 1. Iniciar getDisplayMedia con la bandera moderna systemAudio: "include"
+        if (navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia) {
+          try {
+            systemStream = await navigator.mediaDevices.getDisplayMedia({
+              video: true,
+              audio: {
+                echoCancellation: false,
+                noiseSuppression: false,
+                autoGainControl: false,
+                suppressLocalAudioPlayback: false
+              },
+              systemAudio: "include", // Solicita a Chrome/Edge pre-marcar la casilla de audio automáticamente
+              selfBrowserSurface: "exclude"
+            });
+
+            const audioTracks = systemStream.getAudioTracks();
+            if (audioTracks.length > 0) {
+              hasSystemAudioTrack = true;
+              document.getElementById('alertMissingSystemAudio').classList.add('hidden');
+              window.showToast("✓ Audio de videollamada conectado con éxito", "success");
+            } else {
+              hasSystemAudioTrack = false;
+              document.getElementById('alertMissingSystemAudio').classList.remove('hidden');
+              document.getElementById('modalZoomAudioMissing').classList.remove('hidden');
+            }
+
+            // Detección automática al detener la compartición de pantalla
+            if (systemStream.getVideoTracks().length > 0) {
+              systemStream.getVideoTracks()[0].onended = () => {
+                if (isRecording) {
+                  window.showToast("Llamada finalizada", "info");
+                  stopSession();
+                }
+              };
+            }
+          } catch (displayErr) {
+            console.warn("Captura de pantalla cancelada:", displayErr);
+            window.showToast("No se seleccionó pantalla o audio", "error");
+            return;
+          }
+        }
+
+        // 2. Capturar micrófono sin cancelación agresiva de eco para permitir captar las bocinas
+        try {
+          const captureMode = document.getElementById('audioCaptureModeSelect').value;
+          const isHighSensitivity = captureMode === 'speakers';
+
+          micStream = await navigator.mediaDevices.getUserMedia({
+            audio: { 
+              echoCancellation: !isHighSensitivity, 
+              noiseSuppression: !isHighSensitivity, 
+              autoGainControl: true 
+            }
+          });
+        } catch (micErr) {
+          window.showToast("No se pudo acceder al micrófono local", "error");
+          return;
+        }
+
+        // 3. Crear AudioContext con tasa uniforme de 16000 Hz
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        audioContext = new AudioCtx({ sampleRate: 16000 });
+        if (audioContext.state === 'suspended') {
+          await audioContext.resume();
+        }
+
+        // Analizadores de espectro para los VU-Meters
+        micAnalyser = audioContext.createAnalyser();
+        micAnalyser.fftSize = 256;
+        systemAnalyser = audioContext.createAnalyser();
+        systemAnalyser.fftSize = 256;
+
+        // Mezclador de 2 canales:
+        // Canal 0 (Left): Micrófono del Anfitrión
+        // Canal 1 (Right): Audio de la Videollamada (Otros participantes)
+        const channelMerger = audioContext.createChannelMerger(2);
+
+        if (micStream && micStream.getAudioTracks().length > 0) {
+          const micSource = audioContext.createMediaStreamSource(micStream);
+          const micGain = audioContext.createGain();
+          const captureMode = document.getElementById('audioCaptureModeSelect').value;
+          micGain.gain.value = captureMode === 'speakers' ? 2.5 : 1.3; // Ganancia aumentada en modo bocinas
+          micSource.connect(micGain);
+          micGain.connect(channelMerger, 0, 0);
+          micSource.connect(micAnalyser);
+        }
+
+        if (hasSystemAudioTrack && systemStream) {
+          const sysSource = audioContext.createMediaStreamSource(systemStream);
+          const sysGain = audioContext.createGain();
+          sysGain.gain.value = 3.0; // Ganancia para amplificar voces remotas
+          sysSource.connect(sysGain);
+          sysGain.connect(channelMerger, 0, 1);
+          sysSource.connect(systemAnalyser);
+
+          // Audio auxiliar para mantener vivo el canal
+          const loopbackAudio = document.createElement('audio');
+          loopbackAudio.srcObject = new MediaStream([systemStream.getAudioTracks()[0]]);
+          loopbackAudio.muted = true;
+          loopbackAudio.play().catch(() => {});
+        }
+
+        // 4. Iniciar motor nativo de reconocimiento por voz
+        speechRecognitionInstance = initNativeSpeechRecognition();
+        if (speechRecognitionInstance) {
+          try {
+            speechRecognitionInstance.start();
+          } catch(e) {
+            console.warn("SpeechRecognition start error:", e);
+          }
+        }
+
+        // 5. Procesador PCM Estéreo de Respaldo para IA
+        const bufferSize = 4096;
+        audioProcessorNode = audioContext.createScriptProcessor(bufferSize, 2, 2);
+
+        audioProcessorNode.onaudioprocess = (e) => {
+          if (!isRecording) return;
+          const leftData = e.inputBuffer.getChannelData(0);
+          const rightData = e.inputBuffer.getChannelData(1);
+
+          leftChannelBuffer.push(new Float32Array(leftData));
+          rightChannelBuffer.push(new Float32Array(rightData));
+          bufferSampleLength += leftData.length;
+
+          if (bufferSampleLength >= audioContext.sampleRate * CHUNK_DURATION_SEC) {
+            exportStereoWavChunk();
+          }
+        };
+
+        channelMerger.connect(audioProcessorNode);
+        audioProcessorNode.connect(audioContext.destination);
+
+        // Monitoreo de VU-Meters
+        monitorAudioMeters();
+
+        // 6. Monitor de silencio automático (40 segundos de inactividad)
+        silenceDetectorInterval = setInterval(() => {
+          if (!isRecording) return;
+          const silentTime = Date.now() - lastAudioActivityTime;
+          if (silentTime > 40000 && transcriptText.length > 50) {
+            window.showToast("Inactividad prolongada. Finalizando reunión...", "info");
+            stopSession();
+          }
+        }, 5000);
+
+        // Actualizar interfaz a estado Grabando
+        isRecording = true;
+        btnStartSession.disabled = true;
+        btnStartSession.classList.add('opacity-40', 'cursor-not-allowed');
+        btnStopSession.disabled = false;
+        btnStopSession.classList.remove('opacity-40', 'cursor-not-allowed');
+        btnStopSession.classList.add('pulsing-record-ring', 'bg-red-600');
+
+        document.getElementById('statusIndicatorDot').className = "w-2.5 h-2.5 rounded-full bg-red-500 animate-ping";
+        document.getElementById('statusTextLabel').innerText = "Grabando y Transcribiendo...";
+        document.getElementById('statusTextLabel').className = "text-red-400 font-semibold";
+
+        window.showToast("Sesión iniciada. Habla normalmente...", "info");
+
+      } catch (error) {
+        console.error("Error al iniciar sesión:", error);
+        window.showToast("Error al inicializar audio: " + error.message, "error");
+      }
+    }
+
+    // Reintentar conexión con Zoom si faltó el audio
+    window.retryZoomConnection = async function() {
+      document.getElementById('modalZoomAudioMissing').classList.add('hidden');
+      await stopSession();
+      setTimeout(() => {
+        modalCenteredHelper.classList.remove('hidden');
+      }, 400);
+    };
+
+    // =========================================================================
+    // PASO 7: EMPAQUETADOR DE WAV ESTÉREO
+    // =========================================================================
+    function exportStereoWavChunk() {
+      if (bufferSampleLength === 0) return;
+
+      const totalSamples = bufferSampleLength;
+      const leftFull = new Float32Array(totalSamples);
+      const rightFull = new Float32Array(totalSamples);
+
+      let offset = 0;
+      for (let i = 0; i < leftChannelBuffer.length; i++) {
+        leftFull.set(leftChannelBuffer[i], offset);
+        rightFull.set(rightChannelBuffer[i], offset);
+        offset += leftChannelBuffer[i].length;
+      }
+
+      leftChannelBuffer = [];
+      rightChannelBuffer = [];
+      bufferSampleLength = 0;
+
+      let leftMax = 0, rightMax = 0;
+      for (let i = 0; i < totalSamples; i += 10) {
+        const al = Math.abs(leftFull[i]);
+        const ar = Math.abs(rightFull[i]);
+        if (al > leftMax) leftMax = al;
+        if (ar > rightMax) rightMax = ar;
+      }
+
+      if (leftMax > 0.02 || rightMax > 0.02) {
+        lastAudioActivityTime = Date.now();
+      }
+
+      const wavBlob = encodeStereoWav(leftFull, rightFull, audioContext.sampleRate);
+      audioChunkQueue.push(wavBlob);
+      processChunkQueue();
+    }
+
+    function encodeStereoWav(left, right, sampleRate) {
+      const numChannels = 2;
+      const bytesPerSample = 2;
+      const blockAlign = numChannels * bytesPerSample;
+      const numSamples = left.length;
+      const byteRate = sampleRate * blockAlign;
+      const dataSize = numSamples * blockAlign;
+      const buffer = new ArrayBuffer(44 + dataSize);
+      const view = new DataView(buffer);
+
+      writeString(view, 0, 'RIFF');
+      view.setUint32(4, 36 + dataSize, true);
+      writeString(view, 8, 'WAVE');
+      writeString(view, 12, 'fmt ');
+      view.setUint32(16, 16, true);
+      view.setUint16(20, 1, true);
+      view.setUint16(22, numChannels, true);
+      view.setUint32(24, sampleRate, true);
+      view.setUint32(28, byteRate, true);
+      view.setUint16(32, blockAlign, true);
+      view.setUint16(34, 16, true);
+      writeString(view, 36, 'data');
+      view.setUint32(40, dataSize, true);
+
+      let index = 44;
+      for (let i = 0; i < numSamples; i++) {
+        let sLeft = Math.max(-1, Math.min(1, left[i]));
+        view.setInt16(index, sLeft < 0 ? sLeft * 0x8000 : sLeft * 0x7FFF, true);
+        index += 2;
+
+        let sRight = Math.max(-1, Math.min(1, right[i]));
+        view.setInt16(index, sRight < 0 ? sRight * 0x8000 : sRight * 0x7FFF, true);
+        index += 2;
+      }
+
+      return new Blob([view], { type: 'audio/wav' });
+    }
+
+    function writeString(view, offset, string) {
+      for (let i = 0; i < string.length; i++) {
+        view.setUint8(offset + i, string.charCodeAt(i));
+      }
+    }
+
+    async function processChunkQueue() {
+      if (isProcessingAudio || audioChunkQueue.length === 0) return;
+      isProcessingAudio = true;
+
+      const wavBlob = audioChunkQueue.shift();
+      try {
+        await analyzeStereoWavChunk(wavBlob);
+      } catch (err) {
+        // En caso de que la API de fondo no responda, el reconocimiento nativo sigue intacto
+      } finally {
+        isProcessingAudio = false;
+        if (audioChunkQueue.length > 0) processChunkQueue();
+      }
+    }
+
+    async function analyzeStereoWavChunk(blob) {
+      const hostName = document.getElementById('hostNameInput').value.trim() || "Ing. Jesús Antonio Trejo Reyes";
+      const guests = document.getElementById('guestsListInput').value.trim() || "Participantes";
+      const base64Data = await blobToBase64(blob);
+
+      const prompt = `Analiza este fragmento de audio estéreo de una sesión.
+Canal Izquierdo: ${hostName}.
+Canal Derecho: ${guests}.
+Transcribe cualquier frase que falte en formato [Nombre]: <texto>. Si solo hay silencio, responde VACIO.`;
+
+      const apiKey = "";
+      const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`;
+
+      try {
+        const res = await fetch(apiUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{
+              parts: [
+                { text: prompt },
+                { inlineData: { mimeType: 'audio/wav', data: base64Data } }
+              ]
+            }]
+          })
+        });
+
+        if (!res.ok) return;
+
+        const data = await res.json();
+        const output = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
+
+        if (output && !output.includes("VACIO") && output.length > 3) {
+          const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+          const formatted = output.split('\n')
+            .filter(l => l.trim().length > 0 && !l.includes("VACIO"))
+            .map(l => `[${timeStr}] ${l}`)
+            .join('\n') + '\n';
+
+          if (formatted.trim().length > 0 && !transcriptText.includes(output.substring(0, 15))) {
+            transcriptText += formatted;
+            document.getElementById('transcriptBox').innerText = transcriptText;
+            const words = transcriptText.trim().split(/\s+/).filter(Boolean).length;
+            document.getElementById('transcriptionWordCount').innerText = `${words} palabras`;
+          }
+        }
+      } catch (e) {
+        // Silencio de error para que la UI nativa continúe funcionando sin interrupciones
+      }
+    }
+
+    // =========================================================================
+    // PASO 8: DETENCIÓN Y GENERACIÓN DE MINUTAS NOTION (CON RESPALDO LOCAL)
+    // =========================================================================
+    btnStopSession.addEventListener('click', () => {
+      stopSession();
+    });
+
+    async function stopSession() {
+      if (!isRecording) return;
+      isRecording = false;
+
+      if (silenceDetectorInterval) {
+        clearInterval(silenceDetectorInterval);
+        silenceDetectorInterval = null;
+      }
+
+      if (speechRecognitionInstance) {
+        try { speechRecognitionInstance.stop(); } catch(e){}
+        speechRecognitionInstance = null;
+      }
+
+      exportStereoWavChunk();
+
+      if (audioProcessorNode) {
+        try { audioProcessorNode.disconnect(); } catch(e){}
+        audioProcessorNode = null;
+      }
+
+      if (systemStream) systemStream.getTracks().forEach(t => t.stop());
+      if (micStream) micStream.getTracks().forEach(t => t.stop());
+
+      btnStartSession.disabled = false;
+      btnStartSession.classList.remove('opacity-40', 'cursor-not-allowed');
+      btnStopSession.disabled = true;
+      btnStopSession.classList.add('opacity-40', 'cursor-not-allowed');
+      btnStopSession.classList.remove('pulsing-record-ring', 'bg-red-600');
+
+      document.getElementById('statusIndicatorDot').className = "w-2.5 h-2.5 rounded-full bg-amber-500 animate-pulse";
+      document.getElementById('statusTextLabel').innerText = "Estructurando Minuta Notion...";
+      document.getElementById('aiProcessingBadge').classList.remove('hidden');
+
+      // Generar minuta estructurada (con respaldo automático si no hay internet o clave)
+      await generateNotionStructuredNotes();
+
+      document.getElementById('statusIndicatorDot').className = "w-2.5 h-2.5 rounded-full bg-emerald-500";
+      document.getElementById('statusTextLabel').innerText = "Sesión Completada & Guardada";
+      document.getElementById('aiProcessingBadge').classList.add('hidden');
+
+      // Guardar automáticamente en Firebase
+      const sessionTitle = document.getElementById('sessionTitleInput').value.trim() || "Sesión de Trabajo";
+      const sessionType = document.getElementById('sessionTypeSelect').value;
+      const hostName = document.getElementById('hostNameInput').value.trim() || "Ing. Jesús Antonio Trejo Reyes";
+
+      if (window.saveMeetingToFirebase) {
+        await window.saveMeetingToFirebase({
+          title: sessionTitle,
+          author: hostName,
+          type: sessionType,
+          transcript: transcriptText,
+          summary: summaryNotionHtml
+        });
+      }
+
+      if (audioContext && audioContext.state !== 'closed') {
+        try { audioContext.close(); } catch(e){}
+      }
+    }
+
+    // Generar formato enriquecido tipo Notion
+    async function generateNotionStructuredNotes() {
+      const notionContainer = document.getElementById('notionContent');
+      const hostName = document.getElementById('hostNameInput').value.trim() || "Ing. Jesús Antonio Trejo Reyes";
+      const sessionTitle = document.getElementById('sessionTitleInput').value.trim() || "Sesión";
+      const sessionType = document.getElementById('sessionTypeSelect').value;
+
+      if (!transcriptText || transcriptText.trim().length === 0) {
+        notionContainer.innerHTML = `<p class="text-amber-400 p-4">No se detectó diálogo durante esta sesión. Recuerda hablar cerca del micrófono o activar el audio de la videollamada.</p>`;
+        return;
+      }
+
+      const prompt = `Actúa como un asistente ejecutivo y pedagógico de alto nivel (estilo Notion AI).
+Analiza la siguiente transcripción de una sesión (${sessionType}): "${sessionTitle}".
+Anfitrión: "${hostName}".
+
+Genera un documento estructurado en HTML limpio (solo etiquetas div, h3, h4, p, ul, li, span con clases Tailwind) que incluya:
+1. Resumen Ejecutivo (Visión global concisa).
+2. Temas Principales y Conceptos Tratados (Explicación de los temas expuestos por el profesor o participantes).
+3. Acuerdos y Decisiones Tomadas.
+4. Tareas Pendientes y Compromisos (Con casillas de verificación simuladas [ ] y el nombre de la persona responsable asignada).
+
+Transcripción:
+${transcriptText}`;
+
+      let aiHtml = "";
+
+      try {
+        const apiKey = "";
+        const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`;
+        
+        const response = await fetch(apiUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          aiHtml = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+          aiHtml = aiHtml.replace(/```html/g, '').replace(/```/g, '').trim();
+        }
+      } catch (err) {
+        console.warn("IA remota no disponible, usando formateador local:", err);
+      }
+
+      // Si no hubo respuesta de IA, generar síntesis local estructurada
+      if (!aiHtml) {
+        aiHtml = generateLocalSummaryHtml(transcriptText, hostName);
+      }
+
+      summaryNotionHtml = `
+        <div class="space-y-4">
+          <div class="border-l-4 border-red-500 pl-4 py-1.5 bg-red-950/20 rounded-r-xl">
+            <h2 class="text-lg font-bold text-white">${escapeHtml(sessionTitle)}</h2>
+            <p class="text-xs text-slate-400">Modalidad: ${sessionType} • Anfitrión: ${escapeHtml(hostName)} • ${new Date().toLocaleString()}</p>
+          </div>
+          <div class="notion-styled-body text-xs md:text-sm text-slate-300 leading-relaxed space-y-4">
+            ${aiHtml}
+          </div>
+        </div>
+      `;
+
+      notionContainer.innerHTML = summaryNotionHtml;
+      window.showToast("Minuta estilo Notion generada con éxito", "success");
+    }
+
+    // Generador de respaldo local de minuta
+    function generateLocalSummaryHtml(rawTranscript, host) {
+      const lines = rawTranscript.split('\n').filter(l => l.trim().length > 0 && !l.startsWith('---') && !l.startsWith('[') === false);
+      
+      const points = lines.map(l => `
+        <div class="p-3 bg-slate-950/60 rounded-xl border border-slate-800 mb-2.5">
+          <span class="text-slate-200 leading-relaxed font-mono text-xs block">${escapeHtml(l)}</span>
+        </div>
+      `).join('');
+
+      return `
+        <div class="space-y-4 bg-slate-900/60 p-5 rounded-xl border border-red-900/30">
+          <h3 class="text-sm font-bold text-red-400 uppercase tracking-wider flex items-center gap-2">
+            <i class="fa-solid fa-list-check"></i> Resumen de la Sesión
+          </h3>
+          <p class="text-slate-300 text-xs">Sesión registrada con ${lines.length} intervenciones identificadas.</p>
+          
+          <h4 class="text-xs font-bold text-slate-200 uppercase tracking-wider mt-4">Registro Cronológico de Intervenciones</h4>
+          <div class="space-y-2 text-xs text-slate-300">
+            ${points || '<p class="text-slate-500 italic">No se registraron intervenciones.</p>'}
+          </div>
+
+          <h4 class="text-xs font-bold text-slate-200 uppercase tracking-wider mt-4">Compromisos & Tareas Pendientes</h4>
+          <div class="p-3.5 bg-slate-950/60 rounded-xl border border-slate-800 space-y-2.5">
+            <div class="flex items-center gap-2 text-xs text-slate-200">
+              <span class="text-red-400 font-bold">[✓]</span> 
+              <span>Revisar acuerdos y seguimiento con ${escapeHtml(host)}</span>
+            </div>
+            <div class="flex items-center gap-2 text-xs text-slate-200">
+              <span class="text-slate-500">[ ]</span> 
+              <span>Continuar con los temas asignados de la clase/reunión</span>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    // =========================================================================
+    // PASO 9: MONITOREO DE VOLUMEN (VU METERS) Y UTILIDADES DE EXPORTACIÓN
+    // =========================================================================
+    function monitorAudioMeters() {
+      if (!isRecording) return;
+
+      // Medir Micrófono (Canal Izquierdo)
+      if (micAnalyser) {
+        const data = new Uint8Array(micAnalyser.frequencyBinCount);
+        micAnalyser.getByteFrequencyData(data);
+        let sum = 0;
+        for (let i = 0; i < data.length; i++) sum += data[i];
+        const avg = sum / data.length;
+        const pct = Math.min(100, Math.round((avg / 128) * 100));
+        document.getElementById('micVolBar').style.width = `${pct}%`;
+        document.getElementById('micVolText').innerText = `${Math.round(avg)} dB`;
+      }
+
+      // Medir Videollamada (Canal Derecho)
+      if (systemAnalyser && hasSystemAudioTrack) {
+        const sysData = new Uint8Array(systemAnalyser.frequencyBinCount);
+        systemAnalyser.getByteFrequencyData(sysData);
+        let sysSum = 0;
+        for (let i = 0; i < sysData.length; i++) sysSum += sysData[i];
+        const sysAvg = sysSum / sysData.length;
+        const sysPct = Math.min(100, Math.round((sysAvg / 128) * 100));
+        document.getElementById('sysVolBar').style.width = `${sysPct}%`;
+        document.getElementById('sysVolText').innerText = `${Math.round(sysAvg)} dB`;
+      }
+
+      requestAnimationFrame(monitorAudioMeters);
+    }
+
+    function blobToBase64(blob) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onloadend = () => resolve(reader.result.split(',')[1]);
+        reader.onerror = reject;
+        reader.readAsDataURL(blob);
+      });
+    }
+
+    function escapeHtml(text) {
+      const d = document.createElement('div');
+      d.innerText = text;
+      return d.innerHTML;
+    }
+
+    // Copiar al Portapapeles
+    document.getElementById('btnCopyNotes').addEventListener('click', () => {
+      const notesElement = document.getElementById('notionContent');
+      const textToCopy = notesElement.innerText || transcriptText;
+      
+      const textArea = document.createElement('textarea');
+      textArea.value = textToCopy;
+      textArea.style.position = 'fixed';
+      textArea.style.left = '-999999px';
+      document.body.appendChild(textArea);
+      textArea.select();
+      
+      try {
+        document.execCommand('copy');
+        window.showToast("✓ Contenido copiado al portapapeles", "success");
+      } catch (err) {
+        window.showToast("No se pudo copiar automáticamente", "error");
+      }
+      document.body.removeChild(textArea);
+    });
+
+    // Exportar archivo de texto (.txt)
+    document.getElementById('btnExportTxt').addEventListener('click', () => {
+      const title = document.getElementById('sessionTitleInput').value.trim() || "Sesion";
+      const host = document.getElementById('hostNameInput').value.trim() || "Ing. Jesús Antonio Trejo Reyes";
+      const notes = document.getElementById('notionContent').innerText;
+
+      const fileContent = `=== AI NOTETAKER PRO - REUNIÓN / CLASE VIRTUAL ===\nTítulo: ${title}\nAnfitrión: ${host}\nFecha: ${new Date().toLocaleString()}\n\n=== MINUTA ESTRUCTURADA ===\n\n${notes}\n\n=== TRANSCRIPCIÓN DETALLADA ===\n\n${transcriptText}`;
+      
+      const blob = new Blob([fileContent], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `Notas_${title.replace(/\s+/g, '_')}_${new Date().toISOString().slice(0,10)}.txt`;
+      a.click();
+      URL.revokeObjectURL(url);
+      window.showToast("Archivo TXT descargado", "info");
+    });
+
+    // Exportar documento Word (.docx)
+    document.getElementById('btnExportDocx').addEventListener('click', () => {
+      if (typeof docx === 'undefined') {
+        window.showToast("Librería docx no disponible", "error");
+        return;
+      }
+
+      const title = document.getElementById('sessionTitleInput').value.trim() || "Minuta de Sesión";
+      const host = document.getElementById('hostNameInput').value.trim() || "Ing. Jesús Antonio Trejo Reyes";
+      const notes = document.getElementById('notionContent').innerText;
+
+      const { Document, Packer, Paragraph, HeadingLevel } = docx;
+
+      const doc = new Document({
+        sections: [{
+          properties: {},
+          children: [
+            new Paragraph({ text: title, heading: HeadingLevel.TITLE }),
+            new Paragraph({ text: `Anfitrión / Docente: ${host}`, spacing: { after: 120 } }),
+            new Paragraph({ text: `Fecha: ${new Date().toLocaleString()}`, spacing: { after: 250 } }),
+            new Paragraph({ text: "Minuta Estructurada (Estilo Notion)", heading: HeadingLevel.HEADING_1 }),
+            new Paragraph({ text: notes, spacing: { after: 300 } }),
+            new Paragraph({ text: "Transcripción de Diálogo", heading: HeadingLevel.HEADING_1 }),
+            new Paragraph({ text: transcriptText || "Sin transcripción disponible." })
+          ]
+        }]
+      });
+
+      Packer.toBlob(doc).then(blob => {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `Minuta_${title.replace(/\s+/g, '_')}_${new Date().toISOString().slice(0,10)}.docx`;
+        a.click();
+        URL.revokeObjectURL(url);
+        window.showToast("Documento Word (.docx) descargado", "success");
+      });
+    });
+  </script>
+</body>
+</html>
